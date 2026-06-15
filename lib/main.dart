@@ -140,6 +140,8 @@ class AppConfig {
     required this.outputDir,
     required this.buildMode,
     required this.extraArgs,
+    required this.runtimeMode,
+    required this.recentProjects,
   });
 
   factory AppConfig.defaults() {
@@ -153,6 +155,8 @@ class AppConfig {
       outputDir: _defaultOutputDir,
       buildMode: 'debug',
       extraArgs: '',
+      runtimeMode: 'embedded',
+      recentProjects: <String>['/storage/emulated/0/Download'],
     );
   }
 
@@ -165,6 +169,8 @@ class AppConfig {
   final String outputDir;
   final String buildMode;
   final String extraArgs;
+  final String runtimeMode;
+  final List<String> recentProjects;
 
   AppConfig copyWith({
     String? projectPath,
@@ -176,6 +182,8 @@ class AppConfig {
     String? outputDir,
     String? buildMode,
     String? extraArgs,
+    String? runtimeMode,
+    List<String>? recentProjects,
   }) {
     return AppConfig(
       projectPath: projectPath ?? this.projectPath,
@@ -187,6 +195,8 @@ class AppConfig {
       outputDir: outputDir ?? this.outputDir,
       buildMode: buildMode ?? this.buildMode,
       extraArgs: extraArgs ?? this.extraArgs,
+      runtimeMode: runtimeMode ?? this.runtimeMode,
+      recentProjects: recentProjects ?? this.recentProjects,
     );
   }
 
@@ -201,6 +211,8 @@ class AppConfig {
       'outputDir': outputDir,
       'buildMode': buildMode,
       'extraArgs': extraArgs,
+      'runtimeMode': runtimeMode,
+      'recentProjects': recentProjects,
     };
   }
 
@@ -217,6 +229,13 @@ class AppConfig {
       outputDir: (json['outputDir'] as String?) ?? defaults.outputDir,
       buildMode: (json['buildMode'] as String?) ?? defaults.buildMode,
       extraArgs: (json['extraArgs'] as String?) ?? defaults.extraArgs,
+      runtimeMode: (json['runtimeMode'] as String?) ?? defaults.runtimeMode,
+      recentProjects:
+          (json['recentProjects'] as List<dynamic>?)
+              ?.whereType<String>()
+              .where((path) => path.trim().isNotEmpty)
+              .toList() ??
+          defaults.recentProjects,
     );
   }
 }
@@ -250,6 +269,7 @@ class NativeStatus {
     required this.storageGranted,
     required this.termuxPermissionGranted,
     required this.termuxServiceAvailable,
+    required this.termuxInstalled,
   });
 
   factory NativeStatus.unknown() {
@@ -257,18 +277,37 @@ class NativeStatus {
       storageGranted: false,
       termuxPermissionGranted: false,
       termuxServiceAvailable: false,
+      termuxInstalled: false,
     );
   }
 
   final bool storageGranted;
   final bool termuxPermissionGranted;
   final bool termuxServiceAvailable;
+  final bool termuxInstalled;
+
+  bool get readyForBuild {
+    return storageGranted &&
+        termuxInstalled &&
+        termuxPermissionGranted &&
+        termuxServiceAvailable;
+  }
+
+  int get readyCount {
+    return [
+      storageGranted,
+      termuxInstalled,
+      termuxPermissionGranted,
+      termuxServiceAvailable,
+    ].where((ready) => ready).length;
+  }
 
   static NativeStatus fromMap(Map<dynamic, dynamic> map) {
     return NativeStatus(
       storageGranted: map['storageGranted'] == true,
       termuxPermissionGranted: map['termuxPermissionGranted'] == true,
       termuxServiceAvailable: map['termuxServiceAvailable'] == true,
+      termuxInstalled: map['termuxInstalled'] == true,
     );
   }
 }
@@ -289,6 +328,16 @@ class NativeBridge {
 
   static Future<void> requestTermuxPermission() {
     return _channel.invokeMethod<void>('requestTermuxPermission');
+  }
+
+  static Future<void> openTermux() {
+    return _channel.invokeMethod<void>('openTermux');
+  }
+
+  static Future<Map<dynamic, dynamic>?> pickProjectDirectory() {
+    return _channel.invokeMethod<Map<dynamic, dynamic>?>(
+      'pickProjectDirectory',
+    );
   }
 
   static Future<Map<dynamic, dynamic>> runTermux({
@@ -328,6 +377,7 @@ class _IdeHomePageState extends State<IdeHomePage> {
   String? _activeLogPath;
   String _activeLogText = '';
   String _statusText = '准备就绪';
+  bool _showOnboarding = true;
   Timer? _logTimer;
 
   @override
@@ -394,11 +444,49 @@ class _IdeHomePageState extends State<IdeHomePage> {
     );
   }
 
+  List<String> _mergeRecentProjects(String selected) {
+    final normalized = selected.trim();
+    final next = <String>[
+      if (normalized.isNotEmpty) normalized,
+      ..._config.recentProjects.where((path) => path != normalized),
+    ];
+    return next.take(8).toList();
+  }
+
+  Future<void> _selectProject(String path) async {
+    final normalized = path.trim();
+    if (normalized.isEmpty) return;
+    final next = _config.copyWith(
+      projectPath: normalized,
+      recentProjects: _mergeRecentProjects(normalized),
+    );
+    setState(() {
+      _config = next;
+      _projectController.text = normalized;
+    });
+    await _store.save(next);
+  }
+
+  Future<void> _pickProjectDirectory() async {
+    try {
+      final result = await NativeBridge.pickProjectDirectory();
+      final path = result?['displayPath']?.toString();
+      if (path == null || path.isEmpty) return;
+      await _selectProject(path);
+      _showSnack('已选择项目：${_baseName(path)}');
+    } on PlatformException catch (error) {
+      _showSnack(error.message ?? '选择目录失败');
+    }
+  }
+
   Future<void> _saveConfig({bool showMessage = false}) async {
     final next = _readConfigFromFields();
-    setState(() => _config = next);
-    await _ensureDirectories(next);
-    await _store.save(next);
+    final withRecent = next.copyWith(
+      recentProjects: _mergeRecentProjects(next.projectPath),
+    );
+    setState(() => _config = withRecent);
+    await _ensureDirectories(withRecent);
+    await _store.save(withRecent);
     if (showMessage && mounted) {
       _showSnack('配置已保存');
     }
@@ -408,7 +496,10 @@ class _IdeHomePageState extends State<IdeHomePage> {
     try {
       final next = await NativeBridge.status();
       if (!mounted) return;
-      setState(() => _status = next);
+      setState(() {
+        _status = next;
+        _showOnboarding = !next.readyForBuild;
+      });
     } catch (error) {
       if (!mounted) return;
       setState(() => _statusText = '原生通道不可用：$error');
@@ -496,12 +587,14 @@ class _IdeHomePageState extends State<IdeHomePage> {
     final flutterPath = _shellQuote('${_config.flutterSdkPath}/bin');
     final androidHome = _shellQuote(_config.androidHome);
     final javaHome = _shellQuote(_config.javaHome);
+    final runtimeMode = _shellQuote(_config.runtimeMode);
     return '''
 mkdir -p $logDir $outputDir
 {
 echo "========== $title =========="
 date
 echo "工作目录: \$(pwd)"
+echo "运行时模式: $runtimeMode"
 export PATH=$flutterPath:/data/data/com.termux/files/usr/bin:\$PATH
 export ANDROID_HOME=$androidHome
 export ANDROID_SDK_ROOT=$androidHome
@@ -535,20 +628,22 @@ exit \$exit_code
 
   Future<void> _runEnvironmentSetup() async {
     await _runTermuxTask(
-      title: '初始化手机 Flutter 环境',
+      title: '一键配置手机 Flutter IDE 环境',
       prefix: 'setup',
       workdir: '/data/data/com.termux/files/home',
       body:
           '''
 echo "安装基础工具..."
 pkg update -y
-pkg install -y git curl wget unzip zip xz-utils openjdk-17 clang cmake ninja make
+pkg install -y git curl wget unzip zip xz-utils openjdk-17 clang cmake ninja make openssh
 mkdir -p "\$HOME/.termux"
+mkdir -p "/storage/emulated/0/Download/phone_flutter_ide_runtime"
 if ! grep -q "^allow-external-apps *= *true" "\$HOME/.termux/termux.properties" 2>/dev/null; then
   printf "\\nallow-external-apps = true\\n" >> "\$HOME/.termux/termux.properties"
 fi
 termux-reload-settings || true
 termux-setup-storage || true
+mkdir -p "\$HOME/projects"
 echo
 echo "检查 Flutter..."
 if [ -x "\$FLUTTER_BIN" ]; then
@@ -556,7 +651,39 @@ if [ -x "\$FLUTTER_BIN" ]; then
   "\$FLUTTER_BIN" doctor -v
 else
   echo "没有找到 Flutter SDK: \$FLUTTER_BIN"
-  echo "可以在 Termux 中安装到 ${_config.flutterSdkPath}"
+  echo "可以把 Flutter SDK 安装到 ${_config.flutterSdkPath}"
+fi
+''',
+    );
+  }
+
+  Future<void> _runEnvironmentAudit() async {
+    await _runTermuxTask(
+      title: 'IDE 环境自检',
+      prefix: 'env-audit',
+      workdir: _projectWorkdir(),
+      body: '''
+echo "Termux: \$(uname -a)"
+echo "PATH: \$PATH"
+echo
+command -v git && git --version || true
+command -v java && java -version || true
+command -v clang && clang --version | head -n 1 || true
+command -v cmake && cmake --version | head -n 1 || true
+command -v ninja && ninja --version || true
+echo
+if [ -x "\$FLUTTER_BIN" ]; then
+  "\$FLUTTER_BIN" --version
+  "\$FLUTTER_BIN" doctor -v
+else
+  echo "Flutter 不存在: \$FLUTTER_BIN"
+fi
+echo
+if [ -f pubspec.yaml ]; then
+  echo "当前项目: \$(pwd)"
+  sed -n '1,80p' pubspec.yaml
+else
+  echo "当前目录没有 pubspec.yaml"
 fi
 ''',
     );
@@ -589,6 +716,38 @@ if [ ! -f pubspec.yaml ]; then
   exit 2
 fi
 "\$FLUTTER_BIN" pub get
+''',
+    );
+  }
+
+  Future<void> _runAnalyze() async {
+    await _runTermuxTask(
+      title: 'Flutter Analyze',
+      prefix: 'analyze',
+      workdir: _projectWorkdir(),
+      body: '''
+if [ ! -f pubspec.yaml ]; then
+  echo "当前目录没有 pubspec.yaml"
+  exit 2
+fi
+"\$FLUTTER_BIN" analyze
+''',
+    );
+  }
+
+  Future<void> _runGitStatus() async {
+    await _runTermuxTask(
+      title: 'Git 状态',
+      prefix: 'git-status',
+      workdir: _projectWorkdir(),
+      body: '''
+if [ ! -d .git ]; then
+  echo "当前目录不是 Git 仓库"
+  exit 0
+fi
+git status --short --branch
+echo
+git log --oneline --decorate --max-count=12
 ''',
     );
   }
@@ -650,6 +809,19 @@ termux-setup-storage
     _showSnack('Termux 初始化命令已复制');
   }
 
+  Future<void> _openTermux() async {
+    try {
+      await NativeBridge.openTermux();
+    } on PlatformException catch (error) {
+      _showSnack(error.message ?? '无法打开 Termux');
+    }
+  }
+
+  Future<void> _copyPrompt(String text) async {
+    await Clipboard.setData(ClipboardData(text: text.trim()));
+    _showSnack('提示词已复制');
+  }
+
   void _showSnack(String message) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
@@ -663,6 +835,40 @@ termux-setup-storage
   @override
   Widget build(BuildContext context) {
     final pages = [
+      DashboardPage(
+        status: _status,
+        statusText: _statusText,
+        activeLogText: _activeLogText,
+        activeLogPath: _activeLogPath,
+        projectController: _projectController,
+        currentProject: _config.projectPath,
+        recentProjects: _config.recentProjects,
+        runtimeMode: _config.runtimeMode,
+        onPickProject: _pickProjectDirectory,
+        onSelectProject: _selectProject,
+        onRefreshStatus: _refreshStatus,
+        onOpenStorageSettings: () async {
+          await NativeBridge.openStorageSettings();
+          await Future<void>.delayed(const Duration(milliseconds: 600));
+          _refreshStatus();
+        },
+        onRequestTermuxPermission: () async {
+          await NativeBridge.requestTermuxPermission();
+          await Future<void>.delayed(const Duration(milliseconds: 600));
+          _refreshStatus();
+        },
+        onOpenTermux: _openTermux,
+        onSetup: _runEnvironmentSetup,
+        onAudit: _runEnvironmentAudit,
+        onDoctor: _runDoctor,
+        onPubGet: _runPubGet,
+        onAnalyze: _runAnalyze,
+        onGitStatus: _runGitStatus,
+        onOpenBuildTab: () => setState(() => _tabIndex = 2),
+        onDismissGuide: () => setState(() => _showOnboarding = false),
+        showGuide: _showOnboarding,
+      ),
+      FileBrowserPage(initialPath: _config.projectPath),
       BuildPage(
         status: _status,
         statusText: _statusText,
@@ -685,38 +891,57 @@ termux-setup-storage
           await Future<void>.delayed(const Duration(milliseconds: 600));
           _refreshStatus();
         },
+        onOpenTermux: _openTermux,
         onSetup: _runEnvironmentSetup,
+        onAudit: _runEnvironmentAudit,
         onDoctor: _runDoctor,
         onPubGet: _runPubGet,
         onClean: _runClean,
+        onAnalyze: _runAnalyze,
+        onGitStatus: _runGitStatus,
         onBuild: _runBuild,
       ),
-      FileBrowserPage(initialPath: _projectWorkdir()),
-      LogsPage(
-        logDir: _config.logDir,
-        outputDir: _config.outputDir,
-        activeLogPath: _activeLogPath,
-        onSelectLog: (path) {
-          _startLogPolling(path);
-          setState(() => _tabIndex = 0);
-        },
-      ),
+      PromptPage(onCopyPrompt: _copyPrompt),
       SettingsPage(
+        status: _status,
         flutterController: _flutterController,
         androidHomeController: _androidHomeController,
         javaHomeController: _javaHomeController,
         shellController: _shellController,
         logDirController: _logDirController,
         outputDirController: _outputDirController,
+        runtimeMode: _config.runtimeMode,
+        onRuntimeModeChanged: (mode) async {
+          final next = _config.copyWith(runtimeMode: mode);
+          setState(() => _config = next);
+          await _store.save(next);
+        },
         onSave: () => _saveConfig(showMessage: true),
         onCopySetupCommand: _copySetupCommand,
+        onOpenTermux: _openTermux,
+        onSetup: _runEnvironmentSetup,
+        onAudit: _runEnvironmentAudit,
+      ),
+      LogsPage(
+        logDir: _config.logDir,
+        outputDir: _config.outputDir,
+        activeLogPath: _activeLogPath,
+        onSelectLog: (path) {
+          _startLogPolling(path);
+          setState(() => _tabIndex = 2);
+        },
       ),
     ];
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('手机 Flutter IDE'),
+        title: const Text('Mobile Flutter Studio'),
         actions: [
+          IconButton(
+            tooltip: '打开 Termux',
+            onPressed: _openTermux,
+            icon: const Icon(Icons.terminal_outlined),
+          ),
           IconButton(
             tooltip: '刷新状态',
             onPressed: _refreshStatus,
@@ -732,9 +957,9 @@ termux-setup-storage
         onDestinationSelected: (index) => setState(() => _tabIndex = index),
         destinations: const [
           NavigationDestination(
-            icon: Icon(Icons.build_circle_outlined),
-            selectedIcon: Icon(Icons.build_circle),
-            label: '构建',
+            icon: Icon(Icons.dashboard_outlined),
+            selectedIcon: Icon(Icons.dashboard),
+            label: '工作台',
           ),
           NavigationDestination(
             icon: Icon(Icons.folder_open_outlined),
@@ -742,16 +967,538 @@ termux-setup-storage
             label: '文件',
           ),
           NavigationDestination(
-            icon: Icon(Icons.subject_outlined),
-            selectedIcon: Icon(Icons.subject),
-            label: '日志',
+            icon: Icon(Icons.terminal_outlined),
+            selectedIcon: Icon(Icons.terminal),
+            label: '构建',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.auto_awesome_outlined),
+            selectedIcon: Icon(Icons.auto_awesome),
+            label: '提示词',
           ),
           NavigationDestination(
             icon: Icon(Icons.tune_outlined),
             selectedIcon: Icon(Icons.tune),
             label: '设置',
           ),
+          NavigationDestination(
+            icon: Icon(Icons.subject_outlined),
+            selectedIcon: Icon(Icons.subject),
+            label: '日志',
+          ),
         ],
+      ),
+    );
+  }
+}
+
+class DashboardPage extends StatelessWidget {
+  const DashboardPage({
+    super.key,
+    required this.status,
+    required this.statusText,
+    required this.activeLogText,
+    required this.activeLogPath,
+    required this.projectController,
+    required this.currentProject,
+    required this.recentProjects,
+    required this.runtimeMode,
+    required this.onPickProject,
+    required this.onSelectProject,
+    required this.onRefreshStatus,
+    required this.onOpenStorageSettings,
+    required this.onRequestTermuxPermission,
+    required this.onOpenTermux,
+    required this.onSetup,
+    required this.onAudit,
+    required this.onDoctor,
+    required this.onPubGet,
+    required this.onAnalyze,
+    required this.onGitStatus,
+    required this.onOpenBuildTab,
+    required this.onDismissGuide,
+    required this.showGuide,
+  });
+
+  final NativeStatus status;
+  final String statusText;
+  final String activeLogText;
+  final String? activeLogPath;
+  final TextEditingController projectController;
+  final String currentProject;
+  final List<String> recentProjects;
+  final String runtimeMode;
+  final VoidCallback onPickProject;
+  final ValueChanged<String> onSelectProject;
+  final VoidCallback onRefreshStatus;
+  final VoidCallback onOpenStorageSettings;
+  final VoidCallback onRequestTermuxPermission;
+  final VoidCallback onOpenTermux;
+  final VoidCallback onSetup;
+  final VoidCallback onAudit;
+  final VoidCallback onDoctor;
+  final VoidCallback onPubGet;
+  final VoidCallback onAnalyze;
+  final VoidCallback onGitStatus;
+  final VoidCallback onOpenBuildTab;
+  final VoidCallback onDismissGuide;
+  final bool showGuide;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+      children: [
+        IdeHero(
+          title: 'Mobile Flutter Studio',
+          subtitle: '手机端项目编辑、环境配置、日志诊断和 APK 构建工作台',
+          icon: Icons.code_rounded,
+          trailing: status.readyForBuild ? 'READY' : '${status.readyCount}/4',
+        ),
+        if (showGuide) ...[
+          const SizedBox(height: 20),
+          OnboardingPanel(
+            status: status,
+            onOpenStorageSettings: onOpenStorageSettings,
+            onRequestTermuxPermission: onRequestTermuxPermission,
+            onOpenTermux: onOpenTermux,
+            onSetup: onSetup,
+            onDismiss: onDismissGuide,
+          ),
+        ],
+        const SizedBox(height: 20),
+        SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SectionTitle(
+                icon: Icons.insights_outlined,
+                title: '项目栏',
+                subtitle: '选择 Flutter 项目后，会展示到这里并保存到最近项目',
+              ),
+              const SizedBox(height: 16),
+              ProjectHeader(
+                path: currentProject,
+                runtimeMode: runtimeMode,
+                onPickProject: onPickProject,
+              ),
+              const SizedBox(height: 14),
+              TextField(
+                controller: projectController,
+                decoration: const InputDecoration(
+                  labelText: '项目路径',
+                  prefixIcon: Icon(Icons.folder_outlined),
+                ),
+              ),
+              if (recentProjects.isNotEmpty) ...[
+                const SizedBox(height: 14),
+                Text('最近项目', style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 10),
+                SizedBox(
+                  height: 78,
+                  child: ListView.separated(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: recentProjects.length,
+                    separatorBuilder: (context, index) =>
+                        const SizedBox(width: 10),
+                    itemBuilder: (context, index) {
+                      final project = recentProjects[index];
+                      return RecentProjectChip(
+                        path: project,
+                        selected: project == currentProject,
+                        onTap: () => onSelectProject(project),
+                      );
+                    },
+                  ),
+                ),
+              ],
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  ActionChipButton(
+                    icon: Icons.terminal_outlined,
+                    label: '构建面板',
+                    onPressed: onOpenBuildTab,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.fact_check_outlined,
+                    label: '环境自检',
+                    onPressed: onAudit,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.medical_information_outlined,
+                    label: 'Doctor',
+                    onPressed: onDoctor,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.download_done_outlined,
+                    label: 'Pub Get',
+                    onPressed: onPubGet,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.manage_search_outlined,
+                    label: 'Analyze',
+                    onPressed: onAnalyze,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.account_tree_outlined,
+                    label: 'Git状态',
+                    onPressed: onGitStatus,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 20),
+        SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SectionTitle(
+                icon: Icons.health_and_safety_outlined,
+                title: '服务状态',
+                subtitle: '文件权限、Termux、外部命令服务必须全部可用',
+              ),
+              const SizedBox(height: 16),
+              StatusPills(status: status),
+              const SizedBox(height: 12),
+              Text(statusText, style: Theme.of(context).textTheme.bodySmall),
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  ActionChipButton(
+                    icon: Icons.folder_special_outlined,
+                    label: '文件授权',
+                    onPressed: onOpenStorageSettings,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.terminal_outlined,
+                    label: 'Termux授权',
+                    onPressed: onRequestTermuxPermission,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.open_in_new_rounded,
+                    label: '打开Termux',
+                    onPressed: onOpenTermux,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.refresh_rounded,
+                    label: '刷新',
+                    onPressed: onRefreshStatus,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 20),
+        SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              SectionTitle(
+                icon: Icons.receipt_long_outlined,
+                title: '最近终端',
+                subtitle: activeLogPath ?? '暂无运行日志',
+              ),
+              const SizedBox(height: 14),
+              LogBox(
+                text: activeLogText.isEmpty ? '运行命令后会在这里看到日志。' : activeLogText,
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class OnboardingPanel extends StatelessWidget {
+  const OnboardingPanel({
+    super.key,
+    required this.status,
+    required this.onOpenStorageSettings,
+    required this.onRequestTermuxPermission,
+    required this.onOpenTermux,
+    required this.onSetup,
+    required this.onDismiss,
+  });
+
+  final NativeStatus status;
+  final VoidCallback onOpenStorageSettings;
+  final VoidCallback onRequestTermuxPermission;
+  final VoidCallback onOpenTermux;
+  final VoidCallback onSetup;
+  final VoidCallback onDismiss;
+
+  @override
+  Widget build(BuildContext context) {
+    return SectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const SectionTitle(
+            icon: Icons.rocket_launch_outlined,
+            title: '首次环境向导',
+            subtitle: '按顺序完成后，手机就能作为 Flutter Android 打包工作站',
+          ),
+          const SizedBox(height: 16),
+          SetupStepTile(
+            index: 1,
+            title: '开启文件访问',
+            subtitle: '允许 IDE 读取项目、保存日志和复制 APK',
+            done: status.storageGranted,
+            actionLabel: '去授权',
+            onTap: onOpenStorageSettings,
+          ),
+          SetupStepTile(
+            index: 2,
+            title: '检测 Termux',
+            subtitle: status.termuxInstalled
+                ? '已安装，继续授权外部命令服务'
+                : '需要安装 Termux 后才能运行 Flutter 工具链',
+            done: status.termuxInstalled,
+            actionLabel: '打开',
+            onTap: onOpenTermux,
+          ),
+          SetupStepTile(
+            index: 3,
+            title: '授权 RUN_COMMAND',
+            subtitle: '允许本 App 调用 Termux 执行 flutter、git、gradle',
+            done:
+                status.termuxPermissionGranted && status.termuxServiceAvailable,
+            actionLabel: '授权',
+            onTap: onRequestTermuxPermission,
+          ),
+          SetupStepTile(
+            index: 4,
+            title: '一键配置环境',
+            subtitle: '安装 JDK、Git、CMake、Ninja，并检查 Flutter SDK',
+            done: status.readyForBuild,
+            actionLabel: '配置',
+            onTap: onSetup,
+          ),
+          const SizedBox(height: 12),
+          OutlinedButton.icon(
+            onPressed: onDismiss,
+            icon: const Icon(Icons.visibility_off_outlined),
+            label: const Text('暂时隐藏向导'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class SetupStepTile extends StatelessWidget {
+  const SetupStepTile({
+    super.key,
+    required this.index,
+    required this.title,
+    required this.subtitle,
+    required this.done,
+    required this.actionLabel,
+    required this.onTap,
+  });
+
+  final int index;
+  final String title;
+  final String subtitle;
+  final bool done;
+  final String actionLabel;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = done ? _successColor : _primaryColor;
+    return Container(
+      margin: const EdgeInsets.only(bottom: 10),
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: color.withValues(alpha: 0.12)),
+      ),
+      child: Row(
+        children: [
+          CircleAvatar(
+            radius: 16,
+            backgroundColor: color.withValues(alpha: 0.16),
+            child: done
+                ? const Icon(
+                    Icons.check_rounded,
+                    size: 18,
+                    color: _successColor,
+                  )
+                : Text(
+                    '$index',
+                    style: const TextStyle(
+                      color: _primaryColor,
+                      fontSize: 13,
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(title, style: Theme.of(context).textTheme.titleMedium),
+                const SizedBox(height: 4),
+                Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          if (!done)
+            TextButton(onPressed: onTap, child: Text(actionLabel))
+          else
+            const Icon(Icons.verified_outlined, color: _successColor),
+        ],
+      ),
+    );
+  }
+}
+
+class ProjectHeader extends StatelessWidget {
+  const ProjectHeader({
+    super.key,
+    required this.path,
+    required this.runtimeMode,
+    required this.onPickProject,
+  });
+
+  final String path;
+  final String runtimeMode;
+  final VoidCallback onPickProject;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF1F5F9),
+        borderRadius: BorderRadius.circular(18),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 42,
+            height: 42,
+            decoration: BoxDecoration(
+              color: _primaryColor.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: const Icon(Icons.flutter_dash, color: _primaryColor),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  _baseName(path).isEmpty ? '未选择项目' : _baseName(path),
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  '$path · ${runtimeMode == 'embedded' ? '内置运行时优先' : '外部 Termux'}',
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          FilledButton.icon(
+            onPressed: onPickProject,
+            icon: const Icon(Icons.folder_open_outlined, size: 18),
+            label: const Text('选择'),
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(0, 42),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class RecentProjectChip extends StatelessWidget {
+  const RecentProjectChip({
+    super.key,
+    required this.path,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String path;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(16),
+      child: Container(
+        width: 220,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: selected
+              ? _primaryColor.withValues(alpha: 0.1)
+              : const Color(0xFFF8FAFC),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: selected
+                ? _primaryColor.withValues(alpha: 0.25)
+                : const Color(0xFFE2E8F0),
+          ),
+        ),
+        child: Row(
+          children: [
+            Icon(
+              selected ? Icons.folder_special : Icons.folder_outlined,
+              color: selected ? _primaryColor : _bodyColor,
+            ),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Text(
+                    _baseName(path),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                      color: _titleColor,
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    path,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: Theme.of(context).textTheme.bodySmall,
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -771,10 +1518,14 @@ class BuildPage extends StatelessWidget {
     required this.onRefreshStatus,
     required this.onOpenStorageSettings,
     required this.onRequestTermuxPermission,
+    required this.onOpenTermux,
     required this.onSetup,
+    required this.onAudit,
     required this.onDoctor,
     required this.onPubGet,
     required this.onClean,
+    required this.onAnalyze,
+    required this.onGitStatus,
     required this.onBuild,
   });
 
@@ -789,10 +1540,14 @@ class BuildPage extends StatelessWidget {
   final VoidCallback onRefreshStatus;
   final VoidCallback onOpenStorageSettings;
   final VoidCallback onRequestTermuxPermission;
+  final VoidCallback onOpenTermux;
   final VoidCallback onSetup;
+  final VoidCallback onAudit;
   final VoidCallback onDoctor;
   final VoidCallback onPubGet;
   final VoidCallback onClean;
+  final VoidCallback onAnalyze;
+  final VoidCallback onGitStatus;
   final VoidCallback onBuild;
 
   @override
@@ -800,6 +1555,15 @@ class BuildPage extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
       children: [
+        IdeHero(
+          title: '构建终端',
+          subtitle: status.readyForBuild
+              ? '运行时服务已准备，可以直接打包 Android APK'
+              : '先完成环境授权和 Termux 服务配置，再开始构建',
+          icon: Icons.terminal,
+          trailing: '${status.readyCount}/4',
+        ),
+        const SizedBox(height: 20),
         SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -827,6 +1591,11 @@ class BuildPage extends StatelessWidget {
                     icon: Icons.terminal_outlined,
                     label: 'Termux授权',
                     onPressed: onRequestTermuxPermission,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.open_in_new_rounded,
+                    label: '打开Termux',
+                    onPressed: onOpenTermux,
                   ),
                   ActionChipButton(
                     icon: Icons.refresh_rounded,
@@ -912,6 +1681,11 @@ class BuildPage extends StatelessWidget {
                     onPressed: onSetup,
                   ),
                   ActionChipButton(
+                    icon: Icons.fact_check_outlined,
+                    label: '环境自检',
+                    onPressed: onAudit,
+                  ),
+                  ActionChipButton(
                     icon: Icons.medical_information_outlined,
                     label: 'Doctor',
                     onPressed: onDoctor,
@@ -925,6 +1699,16 @@ class BuildPage extends StatelessWidget {
                     icon: Icons.cleaning_services_outlined,
                     label: 'Clean',
                     onPressed: onClean,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.manage_search_outlined,
+                    label: 'Analyze',
+                    onPressed: onAnalyze,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.account_tree_outlined,
+                    label: 'Git状态',
+                    onPressed: onGitStatus,
                   ),
                 ],
               ),
@@ -988,6 +1772,15 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     super.initState();
     _pathController = TextEditingController(text: widget.initialPath);
     _refresh();
+  }
+
+  @override
+  void didUpdateWidget(covariant FileBrowserPage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.initialPath != widget.initialPath && _openedFile == null) {
+      _pathController.text = widget.initialPath;
+      _refresh();
+    }
   }
 
   @override
@@ -1068,6 +1861,13 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
       children: [
+        const IdeHero(
+          title: '项目文件',
+          subtitle: '浏览项目、编辑源码、修改配置文件，适合手机端快速修复和小步迭代',
+          icon: Icons.folder_open,
+          trailing: 'EDITOR',
+        ),
+        const SizedBox(height: 20),
         SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -1149,18 +1949,21 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
           padding: EdgeInsets.zero,
           child: Column(
             children: [
-              for (final item in _items)
-                FileTile(
-                  entity: item,
-                  onTap: () {
-                    if (item is Directory) {
-                      _pathController.text = item.path;
-                      _refresh();
-                    } else if (item is File) {
-                      _openFile(item);
-                    }
-                  },
-                ),
+              if (_items.isEmpty)
+                const EmptyTile(text: '当前目录没有文件')
+              else
+                for (final item in _items)
+                  FileTile(
+                    entity: item,
+                    onTap: () {
+                      if (item is Directory) {
+                        _pathController.text = item.path;
+                        _refresh();
+                      } else if (item is File) {
+                        _openFile(item);
+                      }
+                    },
+                  ),
             ],
           ),
         ),
@@ -1330,33 +2133,272 @@ class _LogsPageState extends State<LogsPage> {
   }
 }
 
-class SettingsPage extends StatelessWidget {
-  const SettingsPage({
-    super.key,
-    required this.flutterController,
-    required this.androidHomeController,
-    required this.javaHomeController,
-    required this.shellController,
-    required this.logDirController,
-    required this.outputDirController,
-    required this.onSave,
-    required this.onCopySetupCommand,
-  });
+class PromptPage extends StatelessWidget {
+  const PromptPage({super.key, required this.onCopyPrompt});
 
-  final TextEditingController flutterController;
-  final TextEditingController androidHomeController;
-  final TextEditingController javaHomeController;
-  final TextEditingController shellController;
-  final TextEditingController logDirController;
-  final TextEditingController outputDirController;
-  final VoidCallback onSave;
-  final VoidCallback onCopySetupCommand;
+  final ValueChanged<String> onCopyPrompt;
+
+  static const List<PromptTemplate> _templates = [
+    PromptTemplate(
+      icon: Icons.bug_report_outlined,
+      title: '分析构建失败',
+      subtitle: '把日志交给 AI，要求定位根因和给出补丁',
+      prompt: '''
+你是一位资深 Flutter/Android 构建工程师。请分析下面的构建日志，先判断失败根因，再给出最小修复方案。
+要求：
+1. 不要改业务逻辑。
+2. 如果是 Gradle/NDK/JDK/SDK 环境问题，给出明确命令。
+3. 如果是代码问题，给出具体文件和补丁建议。
+4. 最后列出验证命令。
+
+构建日志：
+【把日志粘贴到这里】
+''',
+    ),
+    PromptTemplate(
+      icon: Icons.palette_outlined,
+      title: '现代化 UI 重构',
+      subtitle: '保留业务逻辑，只改布局和视觉',
+      prompt: '''
+你是一位 5 年以上 Flutter UI 工程师。请在 100% 保留业务逻辑、变量名、方法名、点击事件和数据结构的前提下，只重构 UI。
+要求：
+1. Material 3。
+2. 主色 #6366F1，背景 #F8FAFC，卡片 #FFFFFF。
+3. 卡片圆角 20，轻阴影。
+4. 页面采用顶部导航、模块化内容区、底部导航。
+5. 所有控件适配 Android 手机小屏。
+6. 输出需要修改的文件和完整代码。
+''',
+    ),
+    PromptTemplate(
+      icon: Icons.call_outlined,
+      title: '音视频通话排查',
+      subtitle: 'WebRTC、信令、推送、权限一起检查',
+      prompt: '''
+你是一位 Flutter WebRTC 和 IM 信令工程师。请排查音视频通话问题。
+重点检查：
+1. 麦克风/摄像头权限申请。
+2. RTCPeerConnection 创建时机。
+3. addTrack 前 track 是否为空。
+4. 呼叫、接听、取消、忙线、超时信令是否完整。
+5. App 后台或锁屏时推送是否能拉起来电页。
+6. TURN/STUN 配置是否走自建服务器。
+
+现象：
+【描述问题】
+
+日志：
+【粘贴日志】
+''',
+    ),
+    PromptTemplate(
+      icon: Icons.account_tree_outlined,
+      title: 'Git 提交说明',
+      subtitle: '根据变更生成专业 commit message',
+      prompt: '''
+请根据下面的 git diff 生成一个专业的提交说明。
+要求：
+1. 使用中文。
+2. 第一行不超过 50 字。
+3. 正文列出关键改动和验证方式。
+4. 不要夸张描述。
+
+diff：
+【粘贴 git diff】
+''',
+    ),
+    PromptTemplate(
+      icon: Icons.description_outlined,
+      title: 'README 生成',
+      subtitle: '给 Flutter 项目生成用户可读文档',
+      prompt: '''
+请为这个 Flutter 项目生成 README。
+包含：
+1. 项目定位。
+2. 功能列表。
+3. 环境要求。
+4. Android 打包步骤。
+5. 常见问题。
+6. 目录说明。
+
+项目说明：
+【粘贴项目说明】
+''',
+    ),
+  ];
 
   @override
   Widget build(BuildContext context) {
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
       children: [
+        const IdeHero(
+          title: '提示词工作台',
+          subtitle: '把开发、排错、UI 重构和提交说明模板内置到手机 IDE',
+          icon: Icons.auto_awesome,
+          trailing: 'AI',
+        ),
+        const SizedBox(height: 20),
+        for (final template in _templates) ...[
+          SectionCard(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                SectionTitle(
+                  icon: template.icon,
+                  title: template.title,
+                  subtitle: template.subtitle,
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  template.prompt,
+                  maxLines: 5,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    color: _bodyColor,
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    height: 1.45,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                FilledButton.icon(
+                  onPressed: () => onCopyPrompt(template.prompt),
+                  icon: const Icon(Icons.copy_outlined),
+                  label: const Text('复制提示词'),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 14),
+        ],
+      ],
+    );
+  }
+}
+
+class PromptTemplate {
+  const PromptTemplate({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.prompt,
+  });
+
+  final IconData icon;
+  final String title;
+  final String subtitle;
+  final String prompt;
+}
+
+class SettingsPage extends StatelessWidget {
+  const SettingsPage({
+    super.key,
+    required this.status,
+    required this.flutterController,
+    required this.androidHomeController,
+    required this.javaHomeController,
+    required this.shellController,
+    required this.logDirController,
+    required this.outputDirController,
+    required this.runtimeMode,
+    required this.onRuntimeModeChanged,
+    required this.onSave,
+    required this.onCopySetupCommand,
+    required this.onOpenTermux,
+    required this.onSetup,
+    required this.onAudit,
+  });
+
+  final NativeStatus status;
+  final TextEditingController flutterController;
+  final TextEditingController androidHomeController;
+  final TextEditingController javaHomeController;
+  final TextEditingController shellController;
+  final TextEditingController logDirController;
+  final TextEditingController outputDirController;
+  final String runtimeMode;
+  final ValueChanged<String> onRuntimeModeChanged;
+  final VoidCallback onSave;
+  final VoidCallback onCopySetupCommand;
+  final VoidCallback onOpenTermux;
+  final VoidCallback onSetup;
+  final VoidCallback onAudit;
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+      children: [
+        IdeHero(
+          title: '运行时设置',
+          subtitle: '配置手机端 Flutter、Android SDK、JDK 和 Termux 服务',
+          icon: Icons.tune,
+          trailing: status.readyForBuild ? 'ONLINE' : 'SETUP',
+        ),
+        const SizedBox(height: 20),
+        SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SectionTitle(
+                icon: Icons.memory_outlined,
+                title: '运行时模式',
+                subtitle: '当前版本通过 Termux RUN_COMMAND 托管 Flutter 工具链',
+              ),
+              const SizedBox(height: 14),
+              StatusPills(status: status),
+              const SizedBox(height: 12),
+              SegmentedButton<String>(
+                segments: const [
+                  ButtonSegment(
+                    value: 'embedded',
+                    icon: Icon(Icons.inventory_2_outlined),
+                    label: Text('内置运行时'),
+                  ),
+                  ButtonSegment(
+                    value: 'termux',
+                    icon: Icon(Icons.terminal_outlined),
+                    label: Text('外部Termux'),
+                  ),
+                ],
+                selected: {runtimeMode},
+                onSelectionChanged: (value) =>
+                    onRuntimeModeChanged(value.first),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                runtimeMode == 'embedded'
+                    ? '内置运行时模式会优先使用 App 自己准备的工具链目录。当前版本已预留入口；如果内置工具链未安装，会自动回退到 Termux 兼容模式。'
+                    : '外部 Termux 模式使用已安装的 Termux 执行 flutter、git 和 gradle，稳定但需要用户授权 RUN_COMMAND。',
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+              const SizedBox(height: 14),
+              Wrap(
+                spacing: 10,
+                runSpacing: 10,
+                children: [
+                  ActionChipButton(
+                    icon: Icons.open_in_new_rounded,
+                    label: '打开Termux',
+                    onPressed: onOpenTermux,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.install_mobile_outlined,
+                    label: '初始化环境',
+                    onPressed: onSetup,
+                  ),
+                  ActionChipButton(
+                    icon: Icons.fact_check_outlined,
+                    label: '环境自检',
+                    onPressed: onAudit,
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 20),
         SectionCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
@@ -1364,7 +2406,7 @@ class SettingsPage extends StatelessWidget {
               const SectionTitle(
                 icon: Icons.tune_outlined,
                 title: '本机路径',
-                subtitle: '按你手机 Termux 的实际安装路径配置',
+                subtitle: '按这台手机 Termux 的实际安装路径配置',
               ),
               const SizedBox(height: 16),
               SettingsField(
@@ -1414,7 +2456,7 @@ class SettingsPage extends StatelessWidget {
               const SectionTitle(
                 icon: Icons.info_outline,
                 title: '第一次使用',
-                subtitle: '先在 Termux 里允许外部命令，再回到这个 App 授权',
+                subtitle: '如果授权失败，复制脚本到 Termux 手动执行一次',
               ),
               const SizedBox(height: 12),
               const Text(
@@ -1461,6 +2503,94 @@ class SectionCard extends StatelessWidget {
         ],
       ),
       child: child,
+    );
+  }
+}
+
+class IdeHero extends StatelessWidget {
+  const IdeHero({
+    super.key,
+    required this.title,
+    required this.subtitle,
+    required this.icon,
+    required this.trailing,
+  });
+
+  final String title;
+  final String subtitle;
+  final IconData icon;
+  final String trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: _titleColor,
+        borderRadius: BorderRadius.circular(24),
+        boxShadow: const [
+          BoxShadow(
+            color: Color(0x1A000000),
+            blurRadius: 18,
+            offset: Offset(0, 8),
+          ),
+        ],
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+              color: _primaryColor,
+              borderRadius: BorderRadius.circular(16),
+            ),
+            child: Icon(icon, color: Colors.white, size: 26),
+          ),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 20,
+                    fontWeight: FontWeight.w800,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  subtitle,
+                  style: const TextStyle(
+                    color: Color(0xFFCBD5E1),
+                    fontSize: 13,
+                    height: 1.35,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 7),
+            decoration: BoxDecoration(
+              color: Colors.white.withValues(alpha: 0.12),
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              trailing,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -1519,6 +2649,7 @@ class StatusPills extends StatelessWidget {
       runSpacing: 8,
       children: [
         StatusPill(label: '文件访问', ok: status.storageGranted),
+        StatusPill(label: 'Termux安装', ok: status.termuxInstalled),
         StatusPill(label: 'Termux权限', ok: status.termuxPermissionGranted),
         StatusPill(label: 'Termux服务', ok: status.termuxServiceAvailable),
       ],

@@ -7,14 +7,20 @@ import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.Settings
+import android.app.Activity
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
+import java.io.FileOutputStream
+import java.util.zip.ZipInputStream
 
 class MainActivity : FlutterActivity() {
     private val channelName = "com.blinlin.phoneide/native"
     private val termuxPermission = "com.termux.permission.RUN_COMMAND"
     private val termuxRunAction = "com.termux.RUN_COMMAND"
+    private val pickProjectRequestCode = 6201
+    private var pendingPickProjectResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -29,6 +35,20 @@ class MainActivity : FlutterActivity() {
                     "requestTermuxPermission" -> {
                         requestTermuxPermission()
                         result.success(null)
+                    }
+                    "openTermux" -> {
+                        openTermux(result)
+                    }
+                    "pickProjectDirectory" -> {
+                        pickProjectDirectory(result)
+                    }
+                    "installEmbeddedRuntime" -> {
+                        installEmbeddedRuntime(result)
+                    }
+                    "runEmbedded" -> {
+                        val command = call.argument<String>("command") ?: ""
+                        val workdir = call.argument<String>("workdir") ?: ""
+                        runEmbedded(command, workdir, result)
                     }
                     "runTermux" -> {
                         val shell = call.argument<String>("shell")
@@ -46,7 +66,9 @@ class MainActivity : FlutterActivity() {
         return mapOf(
             "storageGranted" to hasStorageAccess(),
             "termuxPermissionGranted" to hasTermuxPermission(),
-            "termuxServiceAvailable" to isTermuxServiceAvailable()
+            "termuxServiceAvailable" to isTermuxServiceAvailable(),
+            "termuxInstalled" to isTermuxInstalled(),
+            "embeddedRuntimeInstalled" to isEmbeddedRuntimeInstalled()
         )
     }
 
@@ -77,6 +99,45 @@ class MainActivity : FlutterActivity() {
         return ComponentName("com.termux", "com.termux.app.RunCommandService")
     }
 
+    private fun isTermuxInstalled(): Boolean {
+        return try {
+            packageManager.getPackageInfo("com.termux", 0)
+            true
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun runtimeRoot(): File {
+        return File(filesDir, "embedded-runtime")
+    }
+
+    private fun runtimePrefix(): File {
+        return File(runtimeRoot(), "usr")
+    }
+
+    private fun runtimeShell(): File {
+        return File(runtimePrefix(), "bin/bash")
+    }
+
+    private fun isEmbeddedRuntimeInstalled(): Boolean {
+        return runtimeShell().exists() && runtimeShell().canExecute()
+    }
+
+    private fun runtimeLogFile(): File {
+        val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val logDir = File(downloads, "phone_flutter_ide_logs")
+        logDir.mkdirs()
+        return File(logDir, "embedded-runtime-install.log")
+    }
+
+    private fun appendRuntimeLog(message: String) {
+        try {
+            runtimeLogFile().appendText("${System.currentTimeMillis()} $message\n")
+        } catch (_: Exception) {
+        }
+    }
+
     private fun openStorageSettings() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val intent = Intent(
@@ -99,6 +160,192 @@ class MainActivity : FlutterActivity() {
     private fun requestTermuxPermission() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             requestPermissions(arrayOf(termuxPermission), 5102)
+        }
+    }
+
+    private fun openTermux(result: MethodChannel.Result) {
+        val launchIntent = packageManager.getLaunchIntentForPackage("com.termux")
+        if (launchIntent == null) {
+            result.error("TERMUX_NOT_INSTALLED", "没有安装 Termux", null)
+            return
+        }
+        try {
+            startActivity(launchIntent)
+            result.success(null)
+        } catch (error: Exception) {
+            result.error("OPEN_TERMUX_FAILED", error.message, null)
+        }
+    }
+
+    private fun pickProjectDirectory(result: MethodChannel.Result) {
+        if (pendingPickProjectResult != null) {
+            result.error("PICK_RUNNING", "已有目录选择器正在运行", null)
+            return
+        }
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+            addFlags(Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)
+        }
+        pendingPickProjectResult = result
+        try {
+            startActivityForResult(intent, pickProjectRequestCode)
+        } catch (error: Exception) {
+            pendingPickProjectResult = null
+            result.error("PICK_FAILED", error.message, null)
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != pickProjectRequestCode) return
+        val pending = pendingPickProjectResult ?: return
+        pendingPickProjectResult = null
+        if (resultCode != Activity.RESULT_OK || data?.data == null) {
+            pending.success(null)
+            return
+        }
+        val uri = data.data!!
+        val flags = data.flags and (
+            Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+        )
+        try {
+            contentResolver.takePersistableUriPermission(uri, flags)
+        } catch (_: Exception) {
+        }
+        pending.success(
+            mapOf(
+                "uri" to uri.toString(),
+                "displayPath" to displayPathFromTreeUri(uri)
+            )
+        )
+    }
+
+    private fun displayPathFromTreeUri(uri: Uri): String {
+        val raw = uri.toString()
+        val marker = "primary%3A"
+        val index = raw.indexOf(marker)
+        if (index >= 0) {
+            val encodedPath = raw.substring(index + marker.length)
+            val decoded = Uri.decode(encodedPath)
+            return if (decoded.isBlank()) {
+                "/storage/emulated/0"
+            } else {
+                "/storage/emulated/0/$decoded"
+            }
+        }
+        return raw
+    }
+
+    private fun installEmbeddedRuntime(result: MethodChannel.Result) {
+        val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val archive = File(downloads, "phone_flutter_ide_runtime/bootstrap-aarch64.zip")
+        if (!archive.exists()) {
+            result.error(
+                "RUNTIME_ARCHIVE_MISSING",
+                "没有找到内置运行时包: ${archive.absolutePath}",
+                null
+            )
+            return
+        }
+        Thread {
+            try {
+                appendRuntimeLog("开始安装内置运行时: ${archive.absolutePath}")
+                val root = runtimeRoot()
+                if (root.exists()) {
+                    root.deleteRecursively()
+                }
+                root.mkdirs()
+                ZipInputStream(archive.inputStream().buffered()).use { zip ->
+                    var entry = zip.nextEntry
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    while (entry != null) {
+                        val outFile = File(root, entry.name)
+                        val canonicalRoot = root.canonicalPath
+                        val canonicalOut = outFile.canonicalPath
+                        if (!canonicalOut.startsWith(canonicalRoot)) {
+                            throw SecurityException("非法 zip 路径: ${entry.name}")
+                        }
+                        if (entry.isDirectory) {
+                            outFile.mkdirs()
+                        } else {
+                            outFile.parentFile?.mkdirs()
+                            FileOutputStream(outFile).use { output ->
+                                while (true) {
+                                    val count = zip.read(buffer)
+                                    if (count <= 0) break
+                                    output.write(buffer, 0, count)
+                                }
+                            }
+                        }
+                        zip.closeEntry()
+                        entry = zip.nextEntry
+                    }
+                }
+                markRuntimeExecutables(runtimeRoot())
+                appendRuntimeLog("内置运行时安装完成: ${runtimeRoot().absolutePath}")
+            } catch (error: Exception) {
+                appendRuntimeLog("内置运行时安装失败: ${error.message}")
+            }
+        }.start()
+        result.success(
+            mapOf(
+                "started" to true,
+                "message" to "内置运行时安装已开始，日志写入 ${runtimeLogFile().absolutePath}"
+            )
+        )
+    }
+
+    private fun markRuntimeExecutables(root: File) {
+        val executableDirs = listOf(
+            File(root, "usr/bin"),
+            File(root, "usr/libexec"),
+            File(root, "usr/lib/apt/methods")
+        )
+        executableDirs.forEach { dir ->
+            if (dir.exists()) {
+                dir.walkTopDown().forEach { file ->
+                    if (file.isFile) {
+                        file.setExecutable(true, true)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun runEmbedded(command: String, workdir: String, result: MethodChannel.Result) {
+        if (command.isBlank()) {
+            result.error("EMPTY_COMMAND", "命令为空", null)
+            return
+        }
+        val shell = runtimeShell()
+        if (!shell.exists()) {
+            result.error("RUNTIME_NOT_INSTALLED", "内置运行时未安装", null)
+            return
+        }
+        try {
+            val workingDir = File(workdir).takeIf { it.exists() && it.isDirectory } ?: filesDir
+            val processBuilder = ProcessBuilder(shell.absolutePath, "-lc", command)
+            processBuilder.directory(workingDir)
+            val env = processBuilder.environment()
+            val prefix = runtimePrefix().absolutePath
+            env["PREFIX"] = prefix
+            env["HOME"] = File(runtimeRoot(), "home").absolutePath
+            env["TMPDIR"] = File(runtimeRoot(), "tmp").absolutePath
+            env["PATH"] = "$prefix/bin:$prefix/bin/applets:${env["PATH"] ?: ""}"
+            File(env["HOME"] ?: "").mkdirs()
+            File(env["TMPDIR"] ?: "").mkdirs()
+            processBuilder.redirectErrorStream(true)
+            processBuilder.start()
+            result.success(
+                mapOf(
+                    "started" to true,
+                    "message" to "内置运行时命令已启动"
+                )
+            )
+        } catch (error: Exception) {
+            result.error("EMBEDDED_START_FAILED", error.message, null)
         }
     }
 
