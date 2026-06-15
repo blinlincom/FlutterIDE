@@ -24,6 +24,10 @@ const String _defaultLogDir =
     '/storage/emulated/0/Download/phone_flutter_ide_logs';
 const String _defaultOutputDir =
     '/storage/emulated/0/Download/phone_flutter_ide_outputs';
+const String _embeddedRuntimeRoot =
+    '/data/user/0/com.blinlin.phoneide.phone_flutter_ide/files/embedded-runtime';
+const String _embeddedRuntimeHome = '$_embeddedRuntimeRoot/home';
+const String _embeddedRuntimePrefix = '$_embeddedRuntimeRoot/usr';
 
 class PhoneFlutterIdeApp extends StatelessWidget {
   const PhoneFlutterIdeApp({super.key});
@@ -147,9 +151,9 @@ class AppConfig {
   factory AppConfig.defaults() {
     return const AppConfig(
       projectPath: '/storage/emulated/0/Download',
-      flutterSdkPath: '/data/data/com.termux/files/home/flutter',
-      androidHome: '/data/data/com.termux/files/home/android-sdk',
-      javaHome: '/data/data/com.termux/files/usr',
+      flutterSdkPath: '$_embeddedRuntimeHome/flutter',
+      androidHome: '$_embeddedRuntimeHome/android-sdk',
+      javaHome: _embeddedRuntimePrefix,
       termuxShell: '/data/data/com.termux/files/usr/bin/bash',
       logDir: _defaultLogDir,
       outputDir: _defaultOutputDir,
@@ -300,10 +304,10 @@ class NativeStatus {
   int get readyCount {
     return [
       storageGranted,
-      termuxInstalled,
-      termuxPermissionGranted,
-      termuxServiceAvailable,
       embeddedRuntimeInstalled,
+      termuxInstalled || embeddedRuntimeInstalled,
+      termuxPermissionGranted || embeddedRuntimeInstalled,
+      termuxServiceAvailable || embeddedRuntimeInstalled,
     ].where((ready) => ready).length;
   }
 
@@ -623,7 +627,7 @@ echo "========== $title =========="
 date
 echo "工作目录: \$(pwd)"
 echo "运行时模式: $runtimeMode"
-export PATH=$flutterPath:/data/data/com.termux/files/usr/bin:\$PATH
+export PATH=$flutterPath:\${PREFIX:-$_embeddedRuntimePrefix}/bin:\$PATH
 export ANDROID_HOME=$androidHome
 export ANDROID_SDK_ROOT=$androidHome
 export JAVA_HOME=$javaHome
@@ -658,20 +662,31 @@ exit \$exit_code
     await _runIdeTask(
       title: '一键配置手机 Flutter IDE 环境',
       prefix: 'setup',
-      workdir: '/data/data/com.termux/files/home',
+      workdir: _runtimeHomeWorkdir(),
       body:
           '''
 echo "安装基础工具..."
-pkg update -y
-pkg install -y git curl wget unzip zip xz-utils openjdk-17 clang cmake ninja make openssh
-mkdir -p "\$HOME/.termux"
-mkdir -p "/storage/emulated/0/Download/phone_flutter_ide_runtime"
-if ! grep -q "^allow-external-apps *= *true" "\$HOME/.termux/termux.properties" 2>/dev/null; then
-  printf "\\nallow-external-apps = true\\n" >> "\$HOME/.termux/termux.properties"
+mkdir -p "\$HOME/projects" "\$ANDROID_HOME" "\$PHONE_FLUTTER_IDE_OUTPUT"
+if command -v pkg >/dev/null 2>&1; then
+  pkg update -y
+  pkg install -y git curl wget unzip zip xz-utils openjdk-17 clang cmake ninja make openssh
+elif command -v apt >/dev/null 2>&1; then
+  apt update -y || true
+  apt install -y git curl wget unzip zip xz-utils openjdk-17 clang cmake ninja make openssh || true
+else
+  echo "当前运行时没有 pkg/apt，说明 bootstrap 还没有包管理器。"
+  echo "请内置完整 Termux bootstrap，或把 bootstrap-aarch64.zip 放到 Download/phone_flutter_ide_runtime 后重新安装。"
 fi
-termux-reload-settings || true
-termux-setup-storage || true
-mkdir -p "\$HOME/projects"
+if command -v termux-reload-settings >/dev/null 2>&1; then
+  mkdir -p "\$HOME/.termux"
+  if ! grep -q "^allow-external-apps *= *true" "\$HOME/.termux/termux.properties" 2>/dev/null; then
+    printf "\\nallow-external-apps = true\\n" >> "\$HOME/.termux/termux.properties"
+  fi
+  termux-reload-settings || true
+fi
+if command -v termux-setup-storage >/dev/null 2>&1; then
+  termux-setup-storage || true
+fi
 echo
 echo "检查 Flutter..."
 if [ -x "\$FLUTTER_BIN" ]; then
@@ -683,6 +698,12 @@ else
 fi
 ''',
     );
+  }
+
+  String _runtimeHomeWorkdir() {
+    return _config.runtimeMode == 'embedded'
+        ? _embeddedRuntimeHome
+        : '/data/data/com.termux/files/home';
   }
 
   Future<void> _runEnvironmentAudit() async {
@@ -859,9 +880,9 @@ termux-setup-storage
     }
   }
 
-  Future<void> _copyPrompt(String text) async {
+  Future<void> _copyCompletion(String text) async {
     await Clipboard.setData(ClipboardData(text: text.trim()));
-    _showSnack('提示词已复制');
+    _showSnack('代码片段已复制');
   }
 
   void _showSnack(String message) {
@@ -900,6 +921,7 @@ termux-setup-storage
           _refreshStatus();
         },
         onOpenTermux: _openTermux,
+        onInstallEmbeddedRuntime: _installEmbeddedRuntime,
         onSetup: _runEnvironmentSetup,
         onAudit: _runEnvironmentAudit,
         onDoctor: _runDoctor,
@@ -943,7 +965,7 @@ termux-setup-storage
         onGitStatus: _runGitStatus,
         onBuild: _runBuild,
       ),
-      PromptPage(onCopyPrompt: _copyPrompt),
+      CompletionPage(onCopyCompletion: _copyCompletion),
       SettingsPage(
         status: _status,
         flutterController: _flutterController,
@@ -1015,9 +1037,9 @@ termux-setup-storage
             label: '构建',
           ),
           NavigationDestination(
-            icon: Icon(Icons.auto_awesome_outlined),
-            selectedIcon: Icon(Icons.auto_awesome),
-            label: '提示词',
+            icon: Icon(Icons.code_outlined),
+            selectedIcon: Icon(Icons.code),
+            label: '补全',
           ),
           NavigationDestination(
             icon: Icon(Icons.tune_outlined),
@@ -1052,6 +1074,7 @@ class DashboardPage extends StatelessWidget {
     required this.onOpenStorageSettings,
     required this.onRequestTermuxPermission,
     required this.onOpenTermux,
+    required this.onInstallEmbeddedRuntime,
     required this.onSetup,
     required this.onAudit,
     required this.onDoctor,
@@ -1077,6 +1100,7 @@ class DashboardPage extends StatelessWidget {
   final VoidCallback onOpenStorageSettings;
   final VoidCallback onRequestTermuxPermission;
   final VoidCallback onOpenTermux;
+  final VoidCallback onInstallEmbeddedRuntime;
   final VoidCallback onSetup;
   final VoidCallback onAudit;
   final VoidCallback onDoctor;
@@ -1105,6 +1129,7 @@ class DashboardPage extends StatelessWidget {
             onOpenStorageSettings: onOpenStorageSettings,
             onRequestTermuxPermission: onRequestTermuxPermission,
             onOpenTermux: onOpenTermux,
+            onInstallEmbeddedRuntime: onInstallEmbeddedRuntime,
             onSetup: onSetup,
             onDismiss: onDismissGuide,
           ),
@@ -1203,7 +1228,7 @@ class DashboardPage extends StatelessWidget {
               const SectionTitle(
                 icon: Icons.health_and_safety_outlined,
                 title: '服务状态',
-                subtitle: '文件权限、Termux、外部命令服务必须全部可用',
+                subtitle: '内置运行时优先，外部 Termux 只作为备用执行入口',
               ),
               const SizedBox(height: 16),
               StatusPills(status: status),
@@ -1220,9 +1245,9 @@ class DashboardPage extends StatelessWidget {
                     onPressed: onOpenStorageSettings,
                   ),
                   ActionChipButton(
-                    icon: Icons.terminal_outlined,
-                    label: 'Termux授权',
-                    onPressed: onRequestTermuxPermission,
+                    icon: Icons.inventory_2_outlined,
+                    label: '安装运行时',
+                    onPressed: onInstallEmbeddedRuntime,
                   ),
                   ActionChipButton(
                     icon: Icons.open_in_new_rounded,
@@ -1268,6 +1293,7 @@ class OnboardingPanel extends StatelessWidget {
     required this.onOpenStorageSettings,
     required this.onRequestTermuxPermission,
     required this.onOpenTermux,
+    required this.onInstallEmbeddedRuntime,
     required this.onSetup,
     required this.onDismiss,
   });
@@ -1276,6 +1302,7 @@ class OnboardingPanel extends StatelessWidget {
   final VoidCallback onOpenStorageSettings;
   final VoidCallback onRequestTermuxPermission;
   final VoidCallback onOpenTermux;
+  final VoidCallback onInstallEmbeddedRuntime;
   final VoidCallback onSetup;
   final VoidCallback onDismiss;
 
@@ -1288,7 +1315,7 @@ class OnboardingPanel extends StatelessWidget {
           const SectionTitle(
             icon: Icons.rocket_launch_outlined,
             title: '首次环境向导',
-            subtitle: '按顺序完成后，手机就能作为 Flutter Android 打包工作站',
+            subtitle: '按顺序安装内置运行时和工具链，手机就能独立打包 APK',
           ),
           const SizedBox(height: 16),
           SetupStepTile(
@@ -1301,30 +1328,36 @@ class OnboardingPanel extends StatelessWidget {
           ),
           SetupStepTile(
             index: 2,
-            title: '检测 Termux',
-            subtitle: status.termuxInstalled
-                ? '已安装，继续授权外部命令服务'
-                : '需要安装 Termux 后才能运行 Flutter 工具链',
-            done: status.termuxInstalled,
-            actionLabel: '打开',
-            onTap: onOpenTermux,
+            title: '安装内置运行时',
+            subtitle: status.embeddedRuntimeInstalled
+                ? '已安装到 App 私有目录，可直接执行 shell 命令'
+                : '优先使用 APK 内置 bootstrap，也支持 Download 目录手动放包',
+            done: status.embeddedRuntimeInstalled,
+            actionLabel: '安装',
+            onTap: onInstallEmbeddedRuntime,
           ),
           SetupStepTile(
             index: 3,
-            title: '授权 RUN_COMMAND',
-            subtitle: '允许本 App 调用 Termux 执行 flutter、git、gradle',
-            done:
-                status.termuxPermissionGranted && status.termuxServiceAvailable,
-            actionLabel: '授权',
-            onTap: onRequestTermuxPermission,
-          ),
-          SetupStepTile(
-            index: 4,
-            title: '一键配置环境',
-            subtitle: '安装 JDK、Git、CMake、Ninja，并检查 Flutter SDK',
+            title: '初始化工具链',
+            subtitle: '安装 Git、JDK、CMake、Ninja，并检查 Flutter SDK',
             done: status.readyForBuild,
             actionLabel: '配置',
             onTap: onSetup,
+          ),
+          SetupStepTile(
+            index: 4,
+            title: '外部 Termux 备用',
+            subtitle: status.termuxInstalled
+                ? '已检测到外部 Termux，必要时可以切换为备用运行时'
+                : '不是必需项，只用于兼容旧的外部执行模式',
+            done:
+                status.termuxInstalled &&
+                status.termuxPermissionGranted &&
+                status.termuxServiceAvailable,
+            actionLabel: status.termuxInstalled ? '授权' : '打开',
+            onTap: status.termuxInstalled
+                ? onRequestTermuxPermission
+                : onOpenTermux,
           ),
           const SizedBox(height: 12),
           OutlinedButton.icon(
@@ -1790,7 +1823,10 @@ class FileBrowserPage extends StatefulWidget {
 class _FileBrowserPageState extends State<FileBrowserPage> {
   late final TextEditingController _pathController;
   final TextEditingController _editorController = TextEditingController();
+  final FocusNode _editorFocusNode = FocusNode();
   List<FileSystemEntity> _items = const [];
+  List<CodeCompletion> _inlineCompletions = const [];
+  TextRange _completionRange = TextRange.empty;
   String? _openedFile;
   String _message = '';
 
@@ -1814,6 +1850,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
   void initState() {
     super.initState();
     _pathController = TextEditingController(text: widget.initialPath);
+    _editorController.addListener(_updateInlineCompletions);
     _refresh();
   }
 
@@ -1828,8 +1865,10 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
 
   @override
   void dispose() {
+    _editorController.removeListener(_updateInlineCompletions);
     _pathController.dispose();
     _editorController.dispose();
+    _editorFocusNode.dispose();
     super.dispose();
   }
 
@@ -1881,6 +1920,8 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
       setState(() {
         _openedFile = file.path;
         _editorController.text = text;
+        _inlineCompletions = const [];
+        _completionRange = TextRange.empty;
         _message = '已打开 ${_baseName(file.path)}';
       });
     } catch (error) {
@@ -1897,6 +1938,114 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
     } catch (error) {
       setState(() => _message = '保存失败：$error');
     }
+  }
+
+  void _insertSnippet(String snippet) {
+    final selection = _editorController.selection;
+    final text = _editorController.text;
+    final start = selection.isValid ? selection.start : text.length;
+    final end = selection.isValid ? selection.end : text.length;
+    final nextText = text.replaceRange(start, end, snippet);
+    _editorController.value = TextEditingValue(
+      text: nextText,
+      selection: TextSelection.collapsed(offset: start + snippet.length),
+    );
+    setState(() {
+      _inlineCompletions = const [];
+      _completionRange = TextRange.empty;
+      _message = '已插入代码片段';
+    });
+    _editorFocusNode.requestFocus();
+  }
+
+  Future<void> _showSnippetSheet() async {
+    final snippet = await showModalBottomSheet<CodeCompletion>(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: Colors.transparent,
+      builder: (context) {
+        return CompletionSheet(
+          completions: CodeCompletionLibrary.items,
+          openedFile: _openedFile,
+        );
+      },
+    );
+    if (snippet != null) {
+      _insertSnippet(snippet.code);
+    }
+  }
+
+  void _updateInlineCompletions() {
+    final path = _openedFile;
+    final value = _editorController.value;
+    final selection = value.selection;
+    if (path == null ||
+        !selection.isValid ||
+        !selection.isCollapsed ||
+        selection.baseOffset < 0 ||
+        selection.baseOffset > value.text.length) {
+      _clearInlineCompletions();
+      return;
+    }
+
+    final offset = selection.baseOffset;
+    final start = _completionWordStart(value.text, offset);
+    final prefix = value.text.substring(start, offset).toLowerCase();
+    if (prefix.length < 2) {
+      _clearInlineCompletions();
+      return;
+    }
+
+    final extension = _extensionOf(path);
+    final matches = CodeCompletionLibrary.inlineMatches(
+      prefix,
+      extension,
+    ).take(4).toList();
+    final nextRange = TextRange(start: start, end: offset);
+    if (_sameCompletions(_inlineCompletions, matches) &&
+        _completionRange == nextRange) {
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() {
+      _inlineCompletions = matches;
+      _completionRange = nextRange;
+    });
+  }
+
+  void _clearInlineCompletions() {
+    if (_inlineCompletions.isEmpty && _completionRange == TextRange.empty) {
+      return;
+    }
+    if (!mounted) return;
+    setState(() {
+      _inlineCompletions = const [];
+      _completionRange = TextRange.empty;
+    });
+  }
+
+  void _applyInlineCompletion(CodeCompletion completion) {
+    final text = _editorController.text;
+    final range = _completionRange;
+    if (!range.isValid || range.start < 0 || range.end > text.length) {
+      _insertSnippet(completion.code);
+      return;
+    }
+
+    final nextText = text.replaceRange(range.start, range.end, completion.code);
+    _editorController.value = TextEditingValue(
+      text: nextText,
+      selection: TextSelection.collapsed(
+        offset: range.start + completion.code.length,
+      ),
+    );
+    setState(() {
+      _inlineCompletions = const [];
+      _completionRange = TextRange.empty;
+      _message = '已补全 ${completion.title}';
+    });
+    _editorFocusNode.requestFocus();
   }
 
   @override
@@ -1965,6 +2114,7 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                 const SizedBox(height: 14),
                 TextField(
                   controller: _editorController,
+                  focusNode: _editorFocusNode,
                   minLines: 12,
                   maxLines: 24,
                   style: const TextStyle(
@@ -1977,11 +2127,32 @@ class _FileBrowserPageState extends State<FileBrowserPage> {
                     labelText: '代码编辑器',
                   ),
                 ),
+                if (_inlineCompletions.isNotEmpty) ...[
+                  const SizedBox(height: 10),
+                  InlineCompletionPanel(
+                    completions: _inlineCompletions,
+                    onSelected: _applyInlineCompletion,
+                  ),
+                ],
                 const SizedBox(height: 12),
-                FilledButton.icon(
-                  onPressed: _saveFile,
-                  icon: const Icon(Icons.save_outlined),
-                  label: const Text('保存文件'),
+                Row(
+                  children: [
+                    Expanded(
+                      child: FilledButton.icon(
+                        onPressed: _saveFile,
+                        icon: const Icon(Icons.save_outlined),
+                        label: const Text('保存文件'),
+                      ),
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: OutlinedButton.icon(
+                        onPressed: _showSnippetSheet,
+                        icon: const Icon(Icons.auto_fix_high_outlined),
+                        label: const Text('插入片段'),
+                      ),
+                    ),
+                  ],
                 ),
               ],
             ),
@@ -2176,162 +2347,524 @@ class _LogsPageState extends State<LogsPage> {
   }
 }
 
-class PromptPage extends StatelessWidget {
-  const PromptPage({super.key, required this.onCopyPrompt});
+class CompletionPage extends StatefulWidget {
+  const CompletionPage({super.key, required this.onCopyCompletion});
 
-  final ValueChanged<String> onCopyPrompt;
+  final ValueChanged<String> onCopyCompletion;
 
-  static const List<PromptTemplate> _templates = [
-    PromptTemplate(
-      icon: Icons.bug_report_outlined,
-      title: '分析构建失败',
-      subtitle: '把日志交给 AI，要求定位根因和给出补丁',
-      prompt: '''
-你是一位资深 Flutter/Android 构建工程师。请分析下面的构建日志，先判断失败根因，再给出最小修复方案。
-要求：
-1. 不要改业务逻辑。
-2. 如果是 Gradle/NDK/JDK/SDK 环境问题，给出明确命令。
-3. 如果是代码问题，给出具体文件和补丁建议。
-4. 最后列出验证命令。
+  @override
+  State<CompletionPage> createState() => _CompletionPageState();
+}
 
-构建日志：
-【把日志粘贴到这里】
-''',
-    ),
-    PromptTemplate(
-      icon: Icons.palette_outlined,
-      title: '现代化 UI 重构',
-      subtitle: '保留业务逻辑，只改布局和视觉',
-      prompt: '''
-你是一位 5 年以上 Flutter UI 工程师。请在 100% 保留业务逻辑、变量名、方法名、点击事件和数据结构的前提下，只重构 UI。
-要求：
-1. Material 3。
-2. 主色 #6366F1，背景 #F8FAFC，卡片 #FFFFFF。
-3. 卡片圆角 20，轻阴影。
-4. 页面采用顶部导航、模块化内容区、底部导航。
-5. 所有控件适配 Android 手机小屏。
-6. 输出需要修改的文件和完整代码。
-''',
-    ),
-    PromptTemplate(
-      icon: Icons.call_outlined,
-      title: '音视频通话排查',
-      subtitle: 'WebRTC、信令、推送、权限一起检查',
-      prompt: '''
-你是一位 Flutter WebRTC 和 IM 信令工程师。请排查音视频通话问题。
-重点检查：
-1. 麦克风/摄像头权限申请。
-2. RTCPeerConnection 创建时机。
-3. addTrack 前 track 是否为空。
-4. 呼叫、接听、取消、忙线、超时信令是否完整。
-5. App 后台或锁屏时推送是否能拉起来电页。
-6. TURN/STUN 配置是否走自建服务器。
+class _CompletionPageState extends State<CompletionPage> {
+  String _query = '';
+  String _category = '全部';
 
-现象：
-【描述问题】
+  List<String> get _categories {
+    return <String>{
+      '全部',
+      ...CodeCompletionLibrary.items.map((item) => item.category),
+    }.toList();
+  }
 
-日志：
-【粘贴日志】
-''',
-    ),
-    PromptTemplate(
-      icon: Icons.account_tree_outlined,
-      title: 'Git 提交说明',
-      subtitle: '根据变更生成专业 commit message',
-      prompt: '''
-请根据下面的 git diff 生成一个专业的提交说明。
-要求：
-1. 使用中文。
-2. 第一行不超过 50 字。
-3. 正文列出关键改动和验证方式。
-4. 不要夸张描述。
-
-diff：
-【粘贴 git diff】
-''',
-    ),
-    PromptTemplate(
-      icon: Icons.description_outlined,
-      title: 'README 生成',
-      subtitle: '给 Flutter 项目生成用户可读文档',
-      prompt: '''
-请为这个 Flutter 项目生成 README。
-包含：
-1. 项目定位。
-2. 功能列表。
-3. 环境要求。
-4. Android 打包步骤。
-5. 常见问题。
-6. 目录说明。
-
-项目说明：
-【粘贴项目说明】
-''',
-    ),
-  ];
+  List<CodeCompletion> get _filteredItems {
+    final query = _query.trim().toLowerCase();
+    return CodeCompletionLibrary.items.where((item) {
+      final categoryMatched = _category == '全部' || item.category == _category;
+      final queryMatched =
+          query.isEmpty ||
+          item.trigger.toLowerCase().contains(query) ||
+          item.title.toLowerCase().contains(query) ||
+          item.description.toLowerCase().contains(query);
+      return categoryMatched && queryMatched;
+    }).toList();
+  }
 
   @override
   Widget build(BuildContext context) {
+    final items = _filteredItems;
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
       children: [
         const IdeHero(
-          title: '提示词工作台',
-          subtitle: '把开发、排错、UI 重构和提交说明模板内置到手机 IDE',
-          icon: Icons.auto_awesome,
-          trailing: 'AI',
+          title: '代码补全',
+          subtitle: 'Flutter/Dart 常用代码片段、Widget 模板和上下文智能提示',
+          icon: Icons.code,
+          trailing: 'SNIP',
         ),
         const SizedBox(height: 20),
-        for (final template in _templates) ...[
-          SectionCard(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                SectionTitle(
-                  icon: template.icon,
-                  title: template.title,
-                  subtitle: template.subtitle,
+        SectionCard(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SectionTitle(
+                icon: Icons.search_outlined,
+                title: '补全搜索',
+                subtitle: '输入触发词，比如 stless、future、list、theme',
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                onChanged: (value) => setState(() => _query = value),
+                decoration: const InputDecoration(
+                  labelText: '搜索补全项',
+                  prefixIcon: Icon(Icons.manage_search_outlined),
                 ),
-                const SizedBox(height: 12),
-                Text(
-                  template.prompt,
-                  maxLines: 5,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(
-                    color: _bodyColor,
-                    fontFamily: 'monospace',
-                    fontSize: 12,
-                    height: 1.45,
-                  ),
+              ),
+              const SizedBox(height: 12),
+              SizedBox(
+                height: 42,
+                child: ListView.separated(
+                  scrollDirection: Axis.horizontal,
+                  itemCount: _categories.length,
+                  separatorBuilder: (context, index) =>
+                      const SizedBox(width: 8),
+                  itemBuilder: (context, index) {
+                    final category = _categories[index];
+                    return ChoiceChip(
+                      label: Text(category),
+                      selected: category == _category,
+                      onSelected: (_) => setState(() => _category = category),
+                    );
+                  },
                 ),
-                const SizedBox(height: 12),
-                FilledButton.icon(
-                  onPressed: () => onCopyPrompt(template.prompt),
-                  icon: const Icon(Icons.copy_outlined),
-                  label: const Text('复制提示词'),
-                ),
-              ],
-            ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 20),
+        for (final item in items) ...[
+          CompletionCard(
+            completion: item,
+            onCopy: () => widget.onCopyCompletion(item.code),
           ),
           const SizedBox(height: 14),
         ],
+        if (items.isEmpty)
+          const SectionCard(child: EmptyTile(text: '没有匹配的补全项')),
       ],
     );
   }
 }
 
-class PromptTemplate {
-  const PromptTemplate({
+class CompletionCard extends StatelessWidget {
+  const CompletionCard({
+    super.key,
+    required this.completion,
+    required this.onCopy,
+  });
+
+  final CodeCompletion completion;
+  final VoidCallback onCopy;
+
+  @override
+  Widget build(BuildContext context) {
+    return SectionCard(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SectionTitle(
+            icon: completion.icon,
+            title: completion.title,
+            subtitle: '${completion.trigger} · ${completion.description}',
+          ),
+          const SizedBox(height: 12),
+          CodePreview(code: completion.code),
+          const SizedBox(height: 12),
+          FilledButton.icon(
+            onPressed: onCopy,
+            icon: const Icon(Icons.copy_outlined),
+            label: const Text('复制代码片段'),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class InlineCompletionPanel extends StatelessWidget {
+  const InlineCompletionPanel({
+    super.key,
+    required this.completions,
+    required this.onSelected,
+  });
+
+  final List<CodeCompletion> completions;
+  final ValueChanged<CodeCompletion> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF1F5F9),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _primaryColor.withValues(alpha: 0.12)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.bolt_outlined, size: 18, color: _primaryColor),
+              const SizedBox(width: 8),
+              Text(
+                '代码补全',
+                style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: _primaryColor,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          for (final completion in completions)
+            InkWell(
+              onTap: () => onSelected(completion),
+              borderRadius: BorderRadius.circular(12),
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+                child: Row(
+                  children: [
+                    Icon(completion.icon, size: 20, color: _bodyColor),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            completion.trigger,
+                            style: Theme.of(context).textTheme.titleMedium,
+                          ),
+                          const SizedBox(height: 2),
+                          Text(
+                            completion.description,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: Theme.of(context).textTheme.bodySmall,
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    const Icon(
+                      Icons.keyboard_return_rounded,
+                      size: 18,
+                      color: _mutedColor,
+                    ),
+                  ],
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class CompletionSheet extends StatelessWidget {
+  const CompletionSheet({
+    super.key,
+    required this.completions,
+    required this.openedFile,
+  });
+
+  final List<CodeCompletion> completions;
+  final String? openedFile;
+
+  @override
+  Widget build(BuildContext context) {
+    final extension = openedFile == null ? '' : _extensionOf(openedFile!);
+    final filtered = completions.where((item) {
+      return item.extensions.isEmpty || item.extensions.contains(extension);
+    }).toList();
+    return Container(
+      height: MediaQuery.of(context).size.height * 0.74,
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+      decoration: const BoxDecoration(
+        color: _backgroundColor,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Center(
+            child: Container(
+              width: 42,
+              height: 4,
+              decoration: BoxDecoration(
+                color: const Color(0xFFCBD5E1),
+                borderRadius: BorderRadius.circular(99),
+              ),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const SectionTitle(
+            icon: Icons.auto_fix_high_outlined,
+            title: '插入代码片段',
+            subtitle: '选择片段后会插入到当前光标位置',
+          ),
+          const SizedBox(height: 16),
+          Expanded(
+            child: ListView.separated(
+              itemCount: filtered.length,
+              separatorBuilder: (context, index) => const SizedBox(height: 12),
+              itemBuilder: (context, index) {
+                final item = filtered[index];
+                return SectionCard(
+                  child: InkWell(
+                    onTap: () => Navigator.of(context).pop(item),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          item.title,
+                          style: Theme.of(context).textTheme.titleMedium,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          '${item.trigger} · ${item.description}',
+                          style: Theme.of(context).textTheme.bodySmall,
+                        ),
+                        const SizedBox(height: 10),
+                        CodePreview(code: item.code, maxLines: 5),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class CodePreview extends StatelessWidget {
+  const CodePreview({super.key, required this.code, this.maxLines = 8});
+
+  final String code;
+  final int maxLines;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0F172A),
+        borderRadius: BorderRadius.circular(14),
+      ),
+      child: Text(
+        code,
+        maxLines: maxLines,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(
+          color: Color(0xFFE2E8F0),
+          fontFamily: 'monospace',
+          fontSize: 12,
+          height: 1.45,
+        ),
+      ),
+    );
+  }
+}
+
+class CodeCompletion {
+  const CodeCompletion({
     required this.icon,
+    required this.category,
+    required this.trigger,
     required this.title,
-    required this.subtitle,
-    required this.prompt,
+    required this.description,
+    required this.code,
+    this.extensions = const <String>[],
   });
 
   final IconData icon;
+  final String category;
+  final String trigger;
   final String title;
-  final String subtitle;
-  final String prompt;
+  final String description;
+  final String code;
+  final List<String> extensions;
+}
+
+class CodeCompletionLibrary {
+  static const List<CodeCompletion> items = [
+    CodeCompletion(
+      icon: Icons.widgets_outlined,
+      category: 'Flutter',
+      trigger: 'stless',
+      title: 'StatelessWidget',
+      description: '创建一个无状态 Widget',
+      extensions: ['.dart'],
+      code: '''
+class MyWidget extends StatelessWidget {
+  const MyWidget({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return const SizedBox.shrink();
+  }
+}
+''',
+    ),
+    CodeCompletion(
+      icon: Icons.widgets_outlined,
+      category: 'Flutter',
+      trigger: 'stful',
+      title: 'StatefulWidget',
+      description: '创建一个有状态 Widget',
+      extensions: ['.dart'],
+      code: '''
+class MyWidget extends StatefulWidget {
+  const MyWidget({super.key});
+
+  @override
+  State<MyWidget> createState() => _MyWidgetState();
+}
+
+class _MyWidgetState extends State<MyWidget> {
+  @override
+  Widget build(BuildContext context) {
+    return const SizedBox.shrink();
+  }
+}
+''',
+    ),
+    CodeCompletion(
+      icon: Icons.view_agenda_outlined,
+      category: 'Flutter',
+      trigger: 'listview',
+      title: 'ListView.separated',
+      description: '常用列表布局',
+      extensions: ['.dart'],
+      code: '''
+ListView.separated(
+  padding: const EdgeInsets.all(16),
+  itemCount: items.length,
+  separatorBuilder: (context, index) => const SizedBox(height: 12),
+  itemBuilder: (context, index) {
+    final item = items[index];
+    return ListTile(
+      title: Text(item.toString()),
+    );
+  },
+)
+''',
+    ),
+    CodeCompletion(
+      icon: Icons.hourglass_top_outlined,
+      category: 'Async',
+      trigger: 'future',
+      title: 'FutureBuilder',
+      description: '异步加载状态模板',
+      extensions: ['.dart'],
+      code: '''
+FutureBuilder(
+  future: loadData(),
+  builder: (context, snapshot) {
+    if (snapshot.connectionState == ConnectionState.waiting) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (snapshot.hasError) {
+      return Center(child: Text(snapshot.error.toString()));
+    }
+    final data = snapshot.data;
+    return Text(data.toString());
+  },
+)
+''',
+    ),
+    CodeCompletion(
+      icon: Icons.stream_outlined,
+      category: 'Async',
+      trigger: 'stream',
+      title: 'StreamBuilder',
+      description: '实时数据流 UI 模板',
+      extensions: ['.dart'],
+      code: '''
+StreamBuilder(
+  stream: stream,
+  builder: (context, snapshot) {
+    if (!snapshot.hasData) {
+      return const SizedBox.shrink();
+    }
+    final data = snapshot.data;
+    return Text(data.toString());
+  },
+)
+''',
+    ),
+    CodeCompletion(
+      icon: Icons.input_outlined,
+      category: 'Form',
+      trigger: 'textcontroller',
+      title: 'TextEditingController',
+      description: '输入框控制器和释放',
+      extensions: ['.dart'],
+      code: '''
+final TextEditingController _controller = TextEditingController();
+
+@override
+void dispose() {
+  _controller.dispose();
+  super.dispose();
+}
+''',
+    ),
+    CodeCompletion(
+      icon: Icons.palette_outlined,
+      category: 'Theme',
+      trigger: 'card20',
+      title: '现代卡片容器',
+      description: '圆角 20、轻阴影、白色卡片',
+      extensions: ['.dart'],
+      code: '''
+Container(
+  padding: const EdgeInsets.all(16),
+  decoration: BoxDecoration(
+    color: Colors.white,
+    borderRadius: BorderRadius.circular(20),
+    boxShadow: const [
+      BoxShadow(
+        color: Color(0x0F000000),
+        blurRadius: 10,
+        offset: Offset(0, 2),
+      ),
+    ],
+  ),
+  child: child,
+)
+''',
+    ),
+    CodeCompletion(
+      icon: Icons.terminal_outlined,
+      category: 'Shell',
+      trigger: 'flutter-build',
+      title: 'Flutter APK 构建命令',
+      description: 'Termux/GitHub Actions 常用命令',
+      extensions: ['.sh', '.md', '.txt', '.yaml', '.yml'],
+      code: '''
+flutter pub get
+flutter analyze
+flutter build apk --debug
+''',
+    ),
+  ];
+
+  static List<CodeCompletion> inlineMatches(String prefix, String extension) {
+    return items.where((item) {
+      final extensionMatched =
+          item.extensions.isEmpty || item.extensions.contains(extension);
+      final queryMatched =
+          item.trigger.toLowerCase().startsWith(prefix) ||
+          item.title.toLowerCase().startsWith(prefix);
+      return extensionMatched && queryMatched;
+    }).toList();
+  }
 }
 
 class SettingsPage extends StatelessWidget {
@@ -2377,7 +2910,7 @@ class SettingsPage extends StatelessWidget {
       children: [
         IdeHero(
           title: '运行时设置',
-          subtitle: '配置手机端 Flutter、Android SDK、JDK 和 Termux 服务',
+          subtitle: '配置内置 shell、Flutter SDK、Android SDK 和 JDK 工具链',
           icon: Icons.tune,
           trailing: status.readyForBuild ? 'ONLINE' : 'SETUP',
         ),
@@ -2389,7 +2922,7 @@ class SettingsPage extends StatelessWidget {
               const SectionTitle(
                 icon: Icons.memory_outlined,
                 title: '运行时模式',
-                subtitle: '当前版本通过 Termux RUN_COMMAND 托管 Flutter 工具链',
+                subtitle: '内置运行时是主模式，外部 Termux 仅作为兼容备用',
               ),
               const SizedBox(height: 14),
               StatusPills(status: status),
@@ -2414,7 +2947,7 @@ class SettingsPage extends StatelessWidget {
               const SizedBox(height: 12),
               Text(
                 runtimeMode == 'embedded'
-                    ? '内置运行时会优先使用 App 私有目录里的 bootstrap。把 bootstrap-aarch64.zip 放到 Download/phone_flutter_ide_runtime 后，点击安装内置运行时。'
+                    ? '内置运行时安装到 App 私有目录。正式包可自带 assets/runtime/bootstrap-aarch64.zip；调试时也可以把 bootstrap-aarch64.zip 放到 Download/phone_flutter_ide_runtime 后安装。'
                     : '外部 Termux 模式使用已安装的 Termux 执行 flutter、git 和 gradle，稳定但需要用户授权 RUN_COMMAND。',
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
@@ -2455,8 +2988,8 @@ class SettingsPage extends StatelessWidget {
             children: [
               const SectionTitle(
                 icon: Icons.tune_outlined,
-                title: '本机路径',
-                subtitle: '按这台手机 Termux 的实际安装路径配置',
+                title: '工具链路径',
+                subtitle: '内置模式默认使用 App 私有目录，外部模式可改成 Termux 路径',
               ),
               const SizedBox(height: 16),
               SettingsField(
@@ -2476,7 +3009,7 @@ class SettingsPage extends StatelessWidget {
               ),
               SettingsField(
                 controller: shellController,
-                label: 'Termux Shell',
+                label: '外部 Termux Shell',
                 icon: Icons.terminal_outlined,
               ),
               SettingsField(
@@ -2505,12 +3038,12 @@ class SettingsPage extends StatelessWidget {
             children: [
               const SectionTitle(
                 icon: Icons.info_outline,
-                title: '第一次使用',
-                subtitle: '如果授权失败，复制脚本到 Termux 手动执行一次',
+                title: '外部 Termux 兼容',
+                subtitle: '只有切到外部 Termux 模式时才需要这段初始化脚本',
               ),
               const SizedBox(height: 12),
               const Text(
-                '如果 Termux 授权按钮启动失败，先打开 Termux 手动执行初始化命令。执行后重启 Termux，再回到本 App 点击初始化环境。',
+                '正式方向是内置运行时完整打包。外部 Termux 只是备用通道，如果授权失败，可打开 Termux 手动执行初始化命令。',
               ),
               const SizedBox(height: 12),
               OutlinedButton.icon(
@@ -2940,6 +3473,34 @@ String _baseName(String path) {
       : path;
   final index = trimmed.lastIndexOf('/');
   return index >= 0 ? trimmed.substring(index + 1) : trimmed;
+}
+
+String _extensionOf(String path) {
+  final name = _baseName(path).toLowerCase();
+  final index = name.lastIndexOf('.');
+  return index >= 0 ? name.substring(index) : '';
+}
+
+int _completionWordStart(String text, int offset) {
+  var index = offset;
+  while (index > 0) {
+    final codeUnit = text.codeUnitAt(index - 1);
+    final isLetter = codeUnit >= 65 && codeUnit <= 90;
+    final isLowercase = codeUnit >= 97 && codeUnit <= 122;
+    final isDigit = codeUnit >= 48 && codeUnit <= 57;
+    final isWord = isLetter || isLowercase || isDigit || codeUnit == 45;
+    if (!isWord) break;
+    index--;
+  }
+  return index;
+}
+
+bool _sameCompletions(List<CodeCompletion> a, List<CodeCompletion> b) {
+  if (a.length != b.length) return false;
+  for (var index = 0; index < a.length; index++) {
+    if (a[index].trigger != b[index].trigger) return false;
+  }
+  return true;
 }
 
 String _fileSubtitle(FileSystemEntity entity) {

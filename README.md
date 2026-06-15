@@ -1,30 +1,40 @@
 # 手机 Flutter IDE
 
-这是一个 Android 手机上使用的 Flutter 项目编辑和 APK 打包 IDE。
+这是一个 Android 手机上使用的 Flutter 项目编辑和 APK 打包 IDE，目标形态是类似手机端编程软件的完整移动 IDE：选择项目、编辑代码、补全片段、执行命令、查看日志并在手机上直接输出 APK。
 
 核心能力：
 
-- 第一次进入后检查文件权限、Termux 权限和 Termux RUN_COMMAND 服务。
+- 第一次进入后检查文件权限、内置运行时和备用 Termux 服务。
 - 工作台项目栏：选择 Flutter 项目后展示当前项目，并保存最近项目。
-- 可以初始化 Termux 基础环境，检查 `flutter doctor`。
+- 可以安装 App 内置运行时，初始化 Git、JDK、CMake、Ninja 等基础工具，并检查 `flutter doctor`。
 - 可以填写 Flutter 项目路径，执行 `pub get`、`clean`、`flutter build apk`。
 - 构建日志实时写入 `/storage/emulated/0/Download/phone_flutter_ide_logs`。
 - 构建成功后 APK 会复制到 `/storage/emulated/0/Download/phone_flutter_ide_outputs`。
 - 内置简单文本文件编辑器，可编辑 Dart、YAML、Gradle、XML、Markdown 等文件。
-- 内置提示词工作台：构建失败分析、UI 重构、音视频排查、Git 提交说明等模板。
+- 内置代码补全：Flutter/Dart 常用代码片段、Widget 模板、异步模板和构建命令片段。
 
 ## 运行时模式
 
-当前 App 提供两种运行时入口：
+当前 App 提供两种运行时入口，默认使用内置运行时：
 
-- 内置运行时优先：App 会预留 `/storage/emulated/0/Download/phone_flutter_ide_runtime` 作为工具链目录，后续可以放入自建 bootstrap、Flutter SDK、Android SDK 和 JDK。
-- 外部 Termux 兼容：使用手机已安装的 Termux 执行真实 `flutter`、`git`、`gradle` 命令。
+- 内置运行时：运行时安装到 App 私有目录 `/data/user/0/com.blinlin.phoneide.phone_flutter_ide/files/embedded-runtime`，命令通过 App 自己的 `ProcessBuilder` 执行。
+- APK 自带运行时：正式包可以把 `bootstrap-aarch64.zip` 放到 `assets/runtime/`，安装时从 APK 内部解压。
+- 调试运行时：开发阶段也可以把 `bootstrap-aarch64.zip` 放到 `/storage/emulated/0/Download/phone_flutter_ide_runtime/`，点击“安装内置运行时”后导入。
+- 外部 Termux 兼容：保留使用已安装 Termux 执行 `flutter`、`git`、`gradle` 命令的备用模式。
 
-Android 普通 App 不能直接复用 Termux 私有沙盒，也不能简单把官方 Termux bootstrap 原样塞进另一个包名稳定运行。因此当前版本默认提供“内置运行时入口 + 外部 Termux 兼容执行”。如果后续要完全内置，需要单独制作自有 bootstrap 包和工具链分发。
+Termux 是开源生态，可以参考它的 bootstrap、包管理和 shell 执行模型。但本 App 不直接依赖外部 Termux 私有目录，而是使用自己的包名和私有运行时目录。完整手机打包需要分层准备：bootstrap、Flutter SDK、Android SDK、JDK、Gradle 缓存。
 
 ## 第一次使用
 
-先安装 Termux，然后在 Termux 中执行：
+推荐流程：
+
+1. 打开 App，点击“文件授权”。
+2. 点击“安装运行时”，优先从 APK 自带 `assets/runtime/bootstrap-aarch64.zip` 安装；如果 APK 没内置运行时，就从 Download 目录导入。
+3. 点击“初始化环境”，安装或检查 Git、JDK、CMake、Ninja、Flutter SDK、Android SDK。
+4. 在“工作台”点击“选择”，选择 Flutter 项目目录。
+5. 在“构建”里点击“Doctor”或“开始打包 APK”。
+
+外部 Termux 备用模式才需要在 Termux 中执行：
 
 ```sh
 mkdir -p ~/.termux
@@ -35,21 +45,34 @@ pkg install -y git curl wget unzip zip xz-utils openjdk-17 clang cmake ninja mak
 termux-setup-storage
 ```
 
-再打开本 App：
-
-1. 点击“文件授权”，开启所有文件访问权限。
-2. 点击“Termux授权”，允许本 App 调用 Termux 命令。
-3. 在“工作台”点击“选择”，选择 Flutter 项目目录。
-4. 在“设置”里确认运行时模式、Flutter SDK、Android SDK、JAVA_HOME 和 Shell 路径。
-5. 在“构建”里点击“Doctor”或“开始打包 APK”。
-
 ## 默认路径
 
-- Flutter SDK: `/data/data/com.termux/files/home/flutter`
-- Android SDK: `/data/data/com.termux/files/home/android-sdk`
-- Termux Shell: `/data/data/com.termux/files/usr/bin/bash`
+- 内置运行时: `/data/user/0/com.blinlin.phoneide.phone_flutter_ide/files/embedded-runtime`
+- Flutter SDK: `/data/user/0/com.blinlin.phoneide.phone_flutter_ide/files/embedded-runtime/home/flutter`
+- Android SDK: `/data/user/0/com.blinlin.phoneide.phone_flutter_ide/files/embedded-runtime/home/android-sdk`
+- JAVA_HOME: `/data/user/0/com.blinlin.phoneide.phone_flutter_ide/files/embedded-runtime/usr`
+- 外部 Termux Shell: `/data/data/com.termux/files/usr/bin/bash`
 - 日志目录: `/storage/emulated/0/Download/phone_flutter_ide_logs`
 - APK 输出目录: `/storage/emulated/0/Download/phone_flutter_ide_outputs`
+
+## 内置运行时包
+
+完整离线 APK 可以内置：
+
+```text
+assets/runtime/bootstrap-aarch64.zip
+```
+
+这个 zip 解压后应包含：
+
+```text
+usr/bin/bash
+usr/bin/pkg 或 usr/bin/apt
+usr/lib
+home
+```
+
+运行时包、Flutter SDK、Android SDK、JDK 体积很大，不建议直接提交到 Git 仓库。更合理的方式是通过发布脚本或下载器生成完整测试包。
 
 ## GitHub 自动打包
 
@@ -63,4 +86,4 @@ termux-setup-storage
 
 ## 注意
 
-Android 普通 App 不能直接进入 Termux 沙盒执行命令，所以本项目通过 Termux 的 `com.termux.RUN_COMMAND` 服务启动打包任务。Termux 必须开启 `allow-external-apps = true`。
+如果使用内置运行时，本 App 不需要外部 Termux。只有切换到外部 Termux 备用模式时，才需要 Termux 开启 `allow-external-apps = true`。

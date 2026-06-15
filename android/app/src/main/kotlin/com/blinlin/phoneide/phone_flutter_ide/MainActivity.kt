@@ -8,11 +8,13 @@ import android.os.Build
 import android.os.Environment
 import android.provider.Settings
 import android.app.Activity
+import io.flutter.FlutterInjector
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.util.zip.ZipInputStream
 
 class MainActivity : FlutterActivity() {
@@ -20,6 +22,10 @@ class MainActivity : FlutterActivity() {
     private val termuxPermission = "com.termux.permission.RUN_COMMAND"
     private val termuxRunAction = "com.termux.RUN_COMMAND"
     private val pickProjectRequestCode = 6201
+    private val bundledRuntimeArchives = listOf(
+        "runtime/bootstrap-aarch64.zip",
+        "runtime/bootstrap.zip"
+    )
     private var pendingPickProjectResult: MethodChannel.Result? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -118,6 +124,26 @@ class MainActivity : FlutterActivity() {
 
     private fun runtimeShell(): File {
         return File(runtimePrefix(), "bin/bash")
+    }
+
+    private fun externalRuntimeArchive(): File {
+        val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        return File(downloads, "phone_flutter_ide_runtime/bootstrap-aarch64.zip")
+    }
+
+    private fun bundledRuntimeArchiveName(): String? {
+        for (name in bundledRuntimeArchives) {
+            try {
+                assets.open(flutterAssetPath(name)).close()
+                return name
+            } catch (_: Exception) {
+            }
+        }
+        return null
+    }
+
+    private fun flutterAssetPath(name: String): String {
+        return FlutterInjector.instance().flutterLoader().getLookupKeyForAsset("assets/$name")
     }
 
     private fun isEmbeddedRuntimeInstalled(): Boolean {
@@ -239,48 +265,50 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun installEmbeddedRuntime(result: MethodChannel.Result) {
-        val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val archive = File(downloads, "phone_flutter_ide_runtime/bootstrap-aarch64.zip")
-        if (!archive.exists()) {
+        val assetArchiveName = bundledRuntimeArchiveName()
+        val externalArchive = externalRuntimeArchive()
+        if (assetArchiveName == null && !externalArchive.exists()) {
             result.error(
                 "RUNTIME_ARCHIVE_MISSING",
-                "没有找到内置运行时包: ${archive.absolutePath}",
+                "没有找到内置运行时包。正式包请内置 assets/runtime/bootstrap-aarch64.zip，调试时也可以放到 ${externalArchive.absolutePath}",
                 null
             )
             return
         }
         Thread {
             try {
-                appendRuntimeLog("开始安装内置运行时: ${archive.absolutePath}")
+                val sourceLabel = if (assetArchiveName != null) {
+                    "assets/$assetArchiveName"
+                } else {
+                    externalArchive.absolutePath
+                }
+                appendRuntimeLog("开始安装内置运行时: $sourceLabel")
                 val root = runtimeRoot()
                 if (root.exists()) {
                     root.deleteRecursively()
                 }
                 root.mkdirs()
-                ZipInputStream(archive.inputStream().buffered()).use { zip ->
-                    var entry = zip.nextEntry
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    while (entry != null) {
-                        val outFile = File(root, entry.name)
-                        val canonicalRoot = root.canonicalPath
-                        val canonicalOut = outFile.canonicalPath
-                        if (!canonicalOut.startsWith(canonicalRoot)) {
-                            throw SecurityException("非法 zip 路径: ${entry.name}")
-                        }
-                        if (entry.isDirectory) {
-                            outFile.mkdirs()
-                        } else {
-                            outFile.parentFile?.mkdirs()
-                            FileOutputStream(outFile).use { output ->
-                                while (true) {
-                                    val count = zip.read(buffer)
-                                    if (count <= 0) break
-                                    output.write(buffer, 0, count)
-                                }
-                            }
-                        }
-                        zip.closeEntry()
-                        entry = zip.nextEntry
+                val archiveInput = if (assetArchiveName != null) {
+                    assets.open(flutterAssetPath(assetArchiveName))
+                } else {
+                    externalArchive.inputStream()
+                }
+                archiveInput.use { input ->
+                    unzipRuntime(input, root)
+                }
+                val home = File(root, "home")
+                val tmp = File(root, "tmp")
+                val projects = File(home, "projects")
+                home.mkdirs()
+                tmp.mkdirs()
+                projects.mkdirs()
+                if (!runtimeShell().exists()) {
+                    throw IllegalStateException("bootstrap 缺少 usr/bin/bash")
+                }
+                if (!runtimeShell().canExecute()) {
+                    runtimeShell().setExecutable(true, true)
+                    if (!runtimeShell().canExecute()) {
+                        throw IllegalStateException("usr/bin/bash 没有执行权限")
                     }
                 }
                 markRuntimeExecutables(runtimeRoot())
@@ -295,6 +323,35 @@ class MainActivity : FlutterActivity() {
                 "message" to "内置运行时安装已开始，日志写入 ${runtimeLogFile().absolutePath}"
             )
         )
+    }
+
+    private fun unzipRuntime(input: InputStream, root: File) {
+        ZipInputStream(input.buffered()).use { zip ->
+            var entry = zip.nextEntry
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (entry != null) {
+                val outFile = File(root, entry.name)
+                val canonicalRoot = root.canonicalPath
+                val canonicalOut = outFile.canonicalPath
+                if (!canonicalOut.startsWith(canonicalRoot)) {
+                    throw SecurityException("非法 zip 路径: ${entry.name}")
+                }
+                if (entry.isDirectory) {
+                    outFile.mkdirs()
+                } else {
+                    outFile.parentFile?.mkdirs()
+                    FileOutputStream(outFile).use { output ->
+                        while (true) {
+                            val count = zip.read(buffer)
+                            if (count <= 0) break
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                }
+                zip.closeEntry()
+                entry = zip.nextEntry
+            }
+        }
     }
 
     private fun markRuntimeExecutables(root: File) {
@@ -334,6 +391,9 @@ class MainActivity : FlutterActivity() {
             env["HOME"] = File(runtimeRoot(), "home").absolutePath
             env["TMPDIR"] = File(runtimeRoot(), "tmp").absolutePath
             env["PATH"] = "$prefix/bin:$prefix/bin/applets:${env["PATH"] ?: ""}"
+            env["LD_LIBRARY_PATH"] = "$prefix/lib:${env["LD_LIBRARY_PATH"] ?: ""}"
+            env["TERM"] = "xterm-256color"
+            env["LANG"] = "C.UTF-8"
             File(env["HOME"] ?: "").mkdirs()
             File(env["TMPDIR"] ?: "").mkdirs()
             processBuilder.redirectErrorStream(true)
