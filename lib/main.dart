@@ -270,6 +270,7 @@ class NativeStatus {
     required this.termuxPermissionGranted,
     required this.termuxServiceAvailable,
     required this.termuxInstalled,
+    required this.embeddedRuntimeInstalled,
   });
 
   factory NativeStatus.unknown() {
@@ -278,6 +279,7 @@ class NativeStatus {
       termuxPermissionGranted: false,
       termuxServiceAvailable: false,
       termuxInstalled: false,
+      embeddedRuntimeInstalled: false,
     );
   }
 
@@ -285,12 +287,14 @@ class NativeStatus {
   final bool termuxPermissionGranted;
   final bool termuxServiceAvailable;
   final bool termuxInstalled;
+  final bool embeddedRuntimeInstalled;
 
   bool get readyForBuild {
     return storageGranted &&
-        termuxInstalled &&
-        termuxPermissionGranted &&
-        termuxServiceAvailable;
+        (embeddedRuntimeInstalled ||
+            (termuxInstalled &&
+                termuxPermissionGranted &&
+                termuxServiceAvailable));
   }
 
   int get readyCount {
@@ -299,6 +303,7 @@ class NativeStatus {
       termuxInstalled,
       termuxPermissionGranted,
       termuxServiceAvailable,
+      embeddedRuntimeInstalled,
     ].where((ready) => ready).length;
   }
 
@@ -308,6 +313,7 @@ class NativeStatus {
       termuxPermissionGranted: map['termuxPermissionGranted'] == true,
       termuxServiceAvailable: map['termuxServiceAvailable'] == true,
       termuxInstalled: map['termuxInstalled'] == true,
+      embeddedRuntimeInstalled: map['embeddedRuntimeInstalled'] == true,
     );
   }
 }
@@ -348,6 +354,24 @@ class NativeBridge {
     final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
       'runTermux',
       {'shell': shell, 'command': command, 'workdir': workdir},
+    );
+    return result ?? const {};
+  }
+
+  static Future<Map<dynamic, dynamic>> runEmbedded({
+    required String command,
+    required String workdir,
+  }) async {
+    final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'runEmbedded',
+      {'command': command, 'workdir': workdir},
+    );
+    return result ?? const {};
+  }
+
+  static Future<Map<dynamic, dynamic>> installEmbeddedRuntime() async {
+    final result = await _channel.invokeMethod<Map<dynamic, dynamic>>(
+      'installEmbeddedRuntime',
     );
     return result ?? const {};
   }
@@ -532,7 +556,7 @@ class _IdeHomePageState extends State<IdeHomePage> {
     }
   }
 
-  Future<void> _runTermuxTask({
+  Future<void> _runIdeTask({
     required String title,
     required String prefix,
     required String body,
@@ -541,9 +565,9 @@ class _IdeHomePageState extends State<IdeHomePage> {
     await _saveConfig();
     final logPath = _newLogPath(prefix);
     await File(logPath).parent.create(recursive: true);
-    await File(logPath).writeAsString('[$title] 等待 Termux 启动...\n');
+    await File(logPath).writeAsString('[$title] 等待运行时启动...\n');
     _startLogPolling(logPath);
-    setState(() => _statusText = '$title 已提交到 Termux');
+    setState(() => _statusText = '$title 已提交到运行时');
 
     final wrapped = _wrapTermuxScript(
       title: title,
@@ -551,11 +575,15 @@ class _IdeHomePageState extends State<IdeHomePage> {
       logPath: logPath,
     );
     try {
-      final result = await NativeBridge.runTermux(
-        shell: _config.termuxShell,
-        command: wrapped,
-        workdir: workdir,
-      );
+      final useEmbedded =
+          _config.runtimeMode == 'embedded' && _status.embeddedRuntimeInstalled;
+      final result = useEmbedded
+          ? await NativeBridge.runEmbedded(command: wrapped, workdir: workdir)
+          : await NativeBridge.runTermux(
+              shell: _config.termuxShell,
+              command: wrapped,
+              workdir: workdir,
+            );
       setState(() => _statusText = result['message']?.toString() ?? '命令已启动');
     } on PlatformException catch (error) {
       await File(logPath).writeAsString(
@@ -627,7 +655,7 @@ exit \$exit_code
   }
 
   Future<void> _runEnvironmentSetup() async {
-    await _runTermuxTask(
+    await _runIdeTask(
       title: '一键配置手机 Flutter IDE 环境',
       prefix: 'setup',
       workdir: '/data/data/com.termux/files/home',
@@ -658,7 +686,7 @@ fi
   }
 
   Future<void> _runEnvironmentAudit() async {
-    await _runTermuxTask(
+    await _runIdeTask(
       title: 'IDE 环境自检',
       prefix: 'env-audit',
       workdir: _projectWorkdir(),
@@ -690,7 +718,7 @@ fi
   }
 
   Future<void> _runDoctor() async {
-    await _runTermuxTask(
+    await _runIdeTask(
       title: 'Flutter Doctor',
       prefix: 'doctor',
       workdir: _projectWorkdir(),
@@ -706,7 +734,7 @@ fi
   }
 
   Future<void> _runPubGet() async {
-    await _runTermuxTask(
+    await _runIdeTask(
       title: 'Pub Get',
       prefix: 'pub-get',
       workdir: _projectWorkdir(),
@@ -721,7 +749,7 @@ fi
   }
 
   Future<void> _runAnalyze() async {
-    await _runTermuxTask(
+    await _runIdeTask(
       title: 'Flutter Analyze',
       prefix: 'analyze',
       workdir: _projectWorkdir(),
@@ -736,7 +764,7 @@ fi
   }
 
   Future<void> _runGitStatus() async {
-    await _runTermuxTask(
+    await _runIdeTask(
       title: 'Git 状态',
       prefix: 'git-status',
       workdir: _projectWorkdir(),
@@ -753,7 +781,7 @@ git log --oneline --decorate --max-count=12
   }
 
   Future<void> _runClean() async {
-    await _runTermuxTask(
+    await _runIdeTask(
       title: 'Flutter Clean',
       prefix: 'clean',
       workdir: _projectWorkdir(),
@@ -770,7 +798,7 @@ fi
   Future<void> _runBuild() async {
     final mode = _config.buildMode;
     final extraArgs = _extraArgsController.text.trim();
-    await _runTermuxTask(
+    await _runIdeTask(
       title: '构建 Android APK',
       prefix: 'build-apk',
       workdir: _projectWorkdir(),
@@ -814,6 +842,20 @@ termux-setup-storage
       await NativeBridge.openTermux();
     } on PlatformException catch (error) {
       _showSnack(error.message ?? '无法打开 Termux');
+    }
+  }
+
+  Future<void> _installEmbeddedRuntime() async {
+    try {
+      final result = await NativeBridge.installEmbeddedRuntime();
+      setState(() {
+        _statusText = result['message']?.toString() ?? '内置运行时安装已启动';
+      });
+      _showSnack('内置运行时安装已启动');
+      await Future<void>.delayed(const Duration(seconds: 1));
+      _refreshStatus();
+    } on PlatformException catch (error) {
+      _showSnack(error.message ?? '内置运行时安装失败');
     }
   }
 
@@ -919,6 +961,7 @@ termux-setup-storage
         onSave: () => _saveConfig(showMessage: true),
         onCopySetupCommand: _copySetupCommand,
         onOpenTermux: _openTermux,
+        onInstallEmbeddedRuntime: _installEmbeddedRuntime,
         onSetup: _runEnvironmentSetup,
         onAudit: _runEnvironmentAudit,
       ),
@@ -2306,6 +2349,7 @@ class SettingsPage extends StatelessWidget {
     required this.onSave,
     required this.onCopySetupCommand,
     required this.onOpenTermux,
+    required this.onInstallEmbeddedRuntime,
     required this.onSetup,
     required this.onAudit,
   });
@@ -2322,6 +2366,7 @@ class SettingsPage extends StatelessWidget {
   final VoidCallback onSave;
   final VoidCallback onCopySetupCommand;
   final VoidCallback onOpenTermux;
+  final VoidCallback onInstallEmbeddedRuntime;
   final VoidCallback onSetup;
   final VoidCallback onAudit;
 
@@ -2369,7 +2414,7 @@ class SettingsPage extends StatelessWidget {
               const SizedBox(height: 12),
               Text(
                 runtimeMode == 'embedded'
-                    ? '内置运行时模式会优先使用 App 自己准备的工具链目录。当前版本已预留入口；如果内置工具链未安装，会自动回退到 Termux 兼容模式。'
+                    ? '内置运行时会优先使用 App 私有目录里的 bootstrap。把 bootstrap-aarch64.zip 放到 Download/phone_flutter_ide_runtime 后，点击安装内置运行时。'
                     : '外部 Termux 模式使用已安装的 Termux 执行 flutter、git 和 gradle，稳定但需要用户授权 RUN_COMMAND。',
                 style: Theme.of(context).textTheme.bodyMedium,
               ),
@@ -2378,6 +2423,11 @@ class SettingsPage extends StatelessWidget {
                 spacing: 10,
                 runSpacing: 10,
                 children: [
+                  ActionChipButton(
+                    icon: Icons.inventory_2_outlined,
+                    label: '安装内置运行时',
+                    onPressed: onInstallEmbeddedRuntime,
+                  ),
                   ActionChipButton(
                     icon: Icons.open_in_new_rounded,
                     label: '打开Termux',
@@ -2649,6 +2699,7 @@ class StatusPills extends StatelessWidget {
       runSpacing: 8,
       children: [
         StatusPill(label: '文件访问', ok: status.storageGranted),
+        StatusPill(label: '内置运行时', ok: status.embeddedRuntimeInstalled),
         StatusPill(label: 'Termux安装', ok: status.termuxInstalled),
         StatusPill(label: 'Termux权限', ok: status.termuxPermissionGranted),
         StatusPill(label: 'Termux服务', ok: status.termuxServiceAvailable),
